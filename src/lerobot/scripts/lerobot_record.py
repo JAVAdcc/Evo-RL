@@ -295,6 +295,29 @@ class RecordConfig:
         return ["policy"]
 
 
+def _ensure_human_inloop_compatible_features(
+    dataset_features: dict[str, dict],
+    *,
+    action_feature_names: list[str],
+) -> None:
+    # Keep human-in-loop datasets schema-stable across teleop-only and policy-assisted phases so they can merge.
+    dataset_features["complementary_info.policy_action"] = {
+        "dtype": "float32",
+        "shape": (len(action_feature_names),),
+        "names": action_feature_names,
+    }
+    dataset_features["complementary_info.is_intervention"] = {
+        "dtype": "float32",
+        "shape": (1,),
+        "names": ["is_intervention"],
+    }
+    dataset_features["complementary_info.state"] = {
+        "dtype": "float32",
+        "shape": (1,),
+        "names": ["state"],
+    }
+
+
 @parser.wrap()
 def record(cfg: RecordConfig) -> LeRobotDataset:
     init_logging()
@@ -330,24 +353,10 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             use_videos=cfg.dataset.video,
         ),
     )
-    if cfg.intervention_state_machine_enabled and cfg.policy is not None and cfg.teleop is not None:
+    if cfg.teleop is not None:
         action_names = dataset_features[ACTION]["names"]
         action_names = list(robot.action_features) if action_names is None else list(action_names)
-        dataset_features["complementary_info.policy_action"] = {
-            "dtype": "float32",
-            "shape": (len(action_names),),
-            "names": action_names,
-        }
-        dataset_features["complementary_info.is_intervention"] = {
-            "dtype": "float32",
-            "shape": (1,),
-            "names": ["is_intervention"],
-        }
-        dataset_features["complementary_info.state"] = {
-            "dtype": "float32",
-            "shape": (1,),
-            "names": ["state"],
-        }
+        _ensure_human_inloop_compatible_features(dataset_features, action_feature_names=action_names)
     if cfg.enable_collector_policy_id:
         dataset_features["complementary_info.collector_policy_id"] = {
             "dtype": "string",
@@ -537,6 +546,11 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
         if dataset:
             dataset.finalize()
+            logging.info(
+                "To inspect the recorded dataset, run:\n"
+                "  lerobot-dataset-report --dataset %s",
+                dataset.repo_id,
+            )
 
         if policy_sync_executor is not None:
             policy_sync_executor.shutdown()
@@ -546,7 +560,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         if teleop and teleop.is_connected:
             teleop.disconnect()
 
-        if not is_headless() and listener:
+        if listener and hasattr(listener, "stop"):
             listener.stop()
 
         if cfg.dataset.push_to_hub:
