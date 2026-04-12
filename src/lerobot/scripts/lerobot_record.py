@@ -78,7 +78,7 @@ from lerobot.configs import parser
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
-from lerobot.datasets.utils import combine_feature_dicts
+from lerobot.datasets.utils import combine_feature_dicts, write_info
 from lerobot.datasets.video_utils import VideoEncodingManager
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.processor import make_default_processors
@@ -131,7 +131,10 @@ from lerobot.utils.control_utils import (
 )
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.recording_annotations import (
-    infer_collector_policy_id,
+    COLLECTOR_HUMAN,
+    COLLECTOR_POLICY,
+    RLT_COLLECTOR_POLICY_ID_TO_NAME,
+    infer_collector_policy_version,
     normalize_episode_success_label,
     resolve_episode_success_label,
 )
@@ -254,12 +257,12 @@ class RecordConfig:
     default_episode_success: str | None = None
     # If True, require explicit or default episode labels before saving.
     require_episode_success_label: bool = False
-    # Whether to store step-level collector policy provenance.
-    enable_collector_policy_id: bool = False
-    # Policy identifier used when action source is policy. If omitted, inferred from policy config.
-    collector_policy_id_policy: str | None = None
-    # Policy identifier used when action source is human/teleop.
-    collector_policy_id_human: str = "human"
+    # Unified schema always records step-level collector source ids.
+    enable_collector_policy_id: bool = True
+    # Numeric code used when the executed action comes from the primary policy.
+    collector_policy_id_policy: int = COLLECTOR_POLICY
+    # Numeric code used when the executed action comes from human teleoperation.
+    collector_policy_id_human: int = COLLECTOR_HUMAN
     # ACP inference controls for policy-driven recording.
     acp_inference: ACPInferenceConfig = field(default_factory=ACPInferenceConfig)
     # Retry timeout for transient communication errors (seconds). Set to 0 to fail immediately.
@@ -358,8 +361,14 @@ class RecordConfig:
         if self.default_episode_success is not None:
             self.default_episode_success = normalize_episode_success_label(self.default_episode_success)
 
-        if not self.collector_policy_id_human:
-            raise ValueError("`collector_policy_id_human` must be a non-empty string.")
+        if not self.enable_collector_policy_id:
+            raise ValueError("`enable_collector_policy_id` must stay true for the unified recording schema.")
+        if self.collector_policy_id_human < 0:
+            raise ValueError("`collector_policy_id_human` must be >= 0.")
+        if self.collector_policy_id_policy < 0:
+            raise ValueError("`collector_policy_id_policy` must be >= 0.")
+        if self.collector_policy_id_human == self.collector_policy_id_policy:
+            raise ValueError("`collector_policy_id_human` and `collector_policy_id_policy` must be distinct.")
         if self.acp_inference.use_cfg and not self.acp_inference.enable:
             raise ValueError("`acp_inference.use_cfg=true` requires `acp_inference.enable=true`.")
         if self.acp_inference.cfg_beta < 0:
@@ -380,7 +389,7 @@ def _ensure_human_inloop_compatible_features(
     *,
     action_feature_names: list[str],
 ) -> None:
-    # Keep human-in-loop datasets schema-stable across teleop-only and policy-assisted phases so they can merge.
+    # Unified annotation schema shared by future recorded datasets.
     dataset_features["complementary_info.policy_action"] = {
         "dtype": "float32",
         "shape": (len(action_feature_names),),
@@ -396,20 +405,45 @@ def _ensure_human_inloop_compatible_features(
         "shape": (1,),
         "names": ["state"],
     }
-
-
-def _ensure_rlt_compatible_features(dataset_features: dict[str, dict]) -> None:
     dataset_features["complementary_info.phase"] = {"dtype": "float32", "shape": (1,), "names": ["phase"]}
-    dataset_features["complementary_info.source_type"] = {
-        "dtype": "float32",
+
+
+def _add_collector_policy_id_feature(dataset_features: dict[str, dict]) -> None:
+    dataset_features["complementary_info.collector_policy_id"] = {
+        "dtype": "int64",
         "shape": (1,),
-        "names": ["source_type"],
+        "names": ["collector_policy_id"],
     }
-    dataset_features["complementary_info.is_handover"] = {
-        "dtype": "float32",
-        "shape": (1,),
-        "names": ["is_handover"],
+
+
+def _build_collector_policy_id_codebook(cfg: RecordConfig) -> dict[str, str]:
+    if cfg.rlt.enable:
+        return {str(code): name for code, name in RLT_COLLECTOR_POLICY_ID_TO_NAME.items()}
+    if cfg.policy is None:
+        return {str(cfg.collector_policy_id_human): "human"}
+    return {
+        str(cfg.collector_policy_id_human): "human",
+        str(cfg.collector_policy_id_policy): infer_collector_policy_version(cfg.policy),
     }
+
+
+def _write_schema_metadata(
+    dataset: LeRobotDataset,
+    *,
+    collector_policy_id_codebook: dict[str, str],
+    include_rlt_episode_metadata: bool,
+) -> None:
+    collector_info = dataset.meta.info["features"].get("complementary_info.collector_policy_id")
+    if collector_info is None:
+        return
+    collector_info["info"] = {"codebook": collector_policy_id_codebook}
+    if include_rlt_episode_metadata:
+        dataset.meta.info["rlt_episode_metadata_fields"] = {
+            "rl_intervals": "List of {start_frame, end_frame, outcome} for each RL phase.",
+            "human_intervention_intervals": "List of {start_frame, end_frame} for each human intervention segment.",
+        }
+    dataset.meta.info["recording_schema_version"] = 2
+    write_info(dataset.meta.info, dataset.root)
 
 
 @parser.wrap()
@@ -447,23 +481,17 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             use_videos=cfg.dataset.video,
         ),
     )
-    if cfg.teleop is not None:
-        action_names = dataset_features[ACTION]["names"]
-        action_names = list(robot.action_features) if action_names is None else list(action_names)
-        _ensure_human_inloop_compatible_features(dataset_features, action_feature_names=action_names)
-    if cfg.rlt.enable:
-        _ensure_rlt_compatible_features(dataset_features)
+    action_names = dataset_features[ACTION]["names"]
+    action_names = list(robot.action_features) if action_names is None else list(action_names)
+    _ensure_human_inloop_compatible_features(dataset_features, action_feature_names=action_names)
     if cfg.enable_collector_policy_id:
-        dataset_features["complementary_info.collector_policy_id"] = {
-            "dtype": "string",
-            "shape": (1,),
-            "names": ["collector_policy_id"],
-        }
+        _add_collector_policy_id_feature(dataset_features)
 
     dataset = None
     listener = None
     policy_sync_executor = None
     critical_phase_tracker = None
+    intervention_tracker = None
 
     try:
         if cfg.resume:
@@ -495,6 +523,11 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 batch_encoding_size=cfg.dataset.video_encoding_batch_size,
                 vcodec=cfg.dataset.vcodec,
             )
+        _write_schema_metadata(
+            dataset,
+            collector_policy_id_codebook=_build_collector_policy_id_codebook(cfg),
+            include_rlt_episode_metadata=cfg.rlt.enable,
+        )
 
         # Load pretrained policy
         policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=dataset.meta)
@@ -513,11 +546,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 },
             )
 
-        collector_policy_id_policy = (
-            cfg.collector_policy_id_policy
-            if cfg.collector_policy_id_policy is not None
-            else infer_collector_policy_id(cfg.policy)
-        )
+        collector_policy_id_policy = cfg.collector_policy_id_policy
         collector_policy_id_human = cfg.collector_policy_id_human
 
         robot.connect()
@@ -542,11 +571,13 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
         critical_phase_tracker = None
         if cfg.enable_critical_phase_labeling or (cfg.rlt.enable and cfg.rlt.vla_model):
-            from lerobot.utils.critical_phase_tracker import CriticalPhaseTracker
+            from lerobot.utils.critical_phase_tracker import CriticalPhaseTracker, EpisodeIntervalTracker
 
             critical_phase_tracker = CriticalPhaseTracker(
                 auto_save_path=dataset.root / "critical_phase_intervals.json",
             )
+            if cfg.rlt.enable:
+                intervention_tracker = EpisodeIntervalTracker(label="Human intervention")
 
         # RLT policy is now a standard PreTrainedPolicy — no separate instantiation needed
 
@@ -576,6 +607,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
                 if critical_phase_tracker is not None:
                     critical_phase_tracker.on_episode_start(dataset.num_episodes)
+                if intervention_tracker is not None:
+                    intervention_tracker.on_episode_start(dataset.num_episodes)
                 if policy is not None and hasattr(policy, "set_rl_mode"):
                     policy.reset()
                 record_loop(
@@ -602,11 +635,15 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     communication_retry_timeout_s=cfg.communication_retry_timeout_s,
                     communication_retry_interval_s=cfg.communication_retry_interval_s,
                     critical_phase_tracker=critical_phase_tracker,
+                    rlt_intervention_tracker=intervention_tracker,
                 )
 
                 if critical_phase_tracker is not None:
                     ep_frames = dataset.episode_buffer["size"] if dataset.episode_buffer else 0
                     critical_phase_tracker.on_episode_end(ep_frames)
+                if intervention_tracker is not None:
+                    ep_frames = dataset.episode_buffer["size"] if dataset.episode_buffer else 0
+                    intervention_tracker.on_episode_end(ep_frames)
 
                 episode_success = None
                 if cfg.enable_episode_outcome_labeling:
@@ -661,15 +698,31 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     log_say("Re-record episode", cfg.play_sounds)
                     if critical_phase_tracker is not None:
                         critical_phase_tracker.discard_episode(dataset.num_episodes)
+                    if intervention_tracker is not None:
+                        intervention_tracker.discard_episode(dataset.num_episodes)
                     events["rerecord_episode"] = False
                     events["exit_early"] = False
                     events["episode_outcome"] = None
                     dataset.clear_episode_buffer()
                     continue
 
-                extra_episode_metadata = (
-                    {"episode_success": episode_success} if cfg.enable_episode_outcome_labeling else None
-                )
+                extra_episode_metadata = {}
+                if cfg.enable_episode_outcome_labeling:
+                    extra_episode_metadata["episode_success"] = episode_success
+                if cfg.rlt.enable:
+                    episode_idx = dataset.num_episodes
+                    extra_episode_metadata["rl_intervals"] = (
+                        critical_phase_tracker.serialize_episode_intervals(episode_idx)
+                        if critical_phase_tracker is not None
+                        else []
+                    )
+                    extra_episode_metadata["human_intervention_intervals"] = (
+                        intervention_tracker.serialize_episode_intervals(episode_idx)
+                        if intervention_tracker is not None
+                        else []
+                    )
+                if not extra_episode_metadata:
+                    extra_episode_metadata = None
                 dataset.save_episode(extra_episode_metadata=extra_episode_metadata)
                 recorded_episodes += 1
     finally:

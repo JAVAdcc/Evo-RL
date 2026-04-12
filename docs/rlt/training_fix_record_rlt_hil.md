@@ -97,3 +97,29 @@ hf_hub_download('Shiki42/rlt_pi0.5_screw', 'actor_critic/278ep0411/rl_checkpoint
 | `src/lerobot/rlt/offline_dataset.py` | `_subsample_chunk`: `subsample_indices` → `[:target_len]` |
 | `src/lerobot/rlt/utils.py` | 删除 `subsample_indices` 函数 |
 | `src/lerobot/rlt/__init__.py` | 移除 `subsample_indices` 导出 |
+
+## 统一数据 schema（2026-04-12）
+
+后续录制统一使用以下 annotation 字段：
+
+- `complementary_info.policy_action`
+- `complementary_info.is_intervention`
+- `complementary_info.state`
+- `complementary_info.phase`
+- `complementary_info.collector_policy_id`
+
+其中 `collector_policy_id` 统一存整数 code，具体含义写在 dataset metadata 的 codebook 里。RLT HIL 数据集约定：
+
+- `0 = human`
+- `1 = pi0.5`
+- `2 = pi_rlt_actor`
+
+同时删除逐帧的：
+
+- `complementary_info.source_type`
+- `complementary_info.is_handover`
+
+RLT episode metadata 额外写入：
+
+- `rl_intervals`
+- `human_intervention_intervals`

@@ -136,7 +136,10 @@ def test_record_adds_episode_success_and_collector_policy_id(tmp_path):
     assert "complementary_info.collector_policy_id" in dataset.features
 
     reloaded = LeRobotDataset(DUMMY_REPO_ID, root=root)
-    assert reloaded[0]["complementary_info.collector_policy_id"] == "human"
+    assert int(reloaded[0]["complementary_info.collector_policy_id"]) == 0
+    assert reloaded.meta.info["features"]["complementary_info.collector_policy_id"]["info"]["codebook"] == {
+        "0": "human"
+    }
     assert "episode_success" in reloaded.meta.episodes.column_names
     assert reloaded.meta.episodes[0]["episode_success"] == "failure"
 
@@ -163,20 +166,22 @@ def test_human_inloop_record_works_without_policy_and_saves_annotations(tmp_path
 
     dataset = human_inloop_record(cfg)
     assert cfg.intervention_state_machine_enabled is False
-    assert cfg.collector_policy_id_policy == "human"
+    assert cfg.collector_policy_id_human == 0
     assert "complementary_info.collector_policy_id" in dataset.features
     assert "complementary_info.policy_action" in dataset.features
     assert "complementary_info.is_intervention" in dataset.features
     assert "complementary_info.state" in dataset.features
+    assert "complementary_info.phase" in dataset.features
 
     reloaded = LeRobotDataset(DUMMY_REPO_ID, root=root)
-    assert reloaded[0]["complementary_info.collector_policy_id"] == "human"
+    assert int(reloaded[0]["complementary_info.collector_policy_id"]) == 0
     torch.testing.assert_close(
         reloaded[0]["complementary_info.policy_action"],
         torch.zeros_like(reloaded[0]["action"]),
     )
     assert float(reloaded[0]["complementary_info.is_intervention"]) == 0.0
     assert float(reloaded[0]["complementary_info.state"]) == 0.0
+    assert float(reloaded[0]["complementary_info.phase"]) == 0.0
     assert "episode_success" in reloaded.meta.episodes.column_names
     assert reloaded.meta.episodes[0]["episode_success"] == "failure"
 
@@ -211,6 +216,8 @@ def test_patch_hil_dataset_schema_restores_legacy_dataset_mergeability(tmp_path)
             "complementary_info.policy_action",
             "complementary_info.is_intervention",
             "complementary_info.state",
+            "complementary_info.phase",
+            "complementary_info.collector_policy_id",
         ],
         output_dir=legacy_root,
         repo_id="dummy/repo_legacy",
@@ -229,6 +236,8 @@ def test_patch_hil_dataset_schema_restores_legacy_dataset_mergeability(tmp_path)
     assert "complementary_info.policy_action" in patched_dataset.features
     assert "complementary_info.is_intervention" in patched_dataset.features
     assert "complementary_info.state" in patched_dataset.features
+    assert "complementary_info.phase" in patched_dataset.features
+    assert "complementary_info.collector_policy_id" in patched_dataset.features
     patched_reloaded = LeRobotDataset("dummy/repo_patched", root=patched_root)
     torch.testing.assert_close(
         patched_reloaded[0]["complementary_info.policy_action"],
@@ -236,6 +245,8 @@ def test_patch_hil_dataset_schema_restores_legacy_dataset_mergeability(tmp_path)
     )
     assert float(patched_reloaded[0]["complementary_info.is_intervention"]) == 0.0
     assert float(patched_reloaded[0]["complementary_info.state"]) == 0.0
+    assert float(patched_reloaded[0]["complementary_info.phase"]) == 0.0
+    assert int(patched_reloaded[0]["complementary_info.collector_policy_id"]) == 0
 
     merged_dataset = merge_datasets(
         datasets=[current_dataset, patched_dataset],

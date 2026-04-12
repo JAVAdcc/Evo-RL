@@ -49,11 +49,14 @@ from lerobot.teleoperators import Teleoperator, koch_leader, omx_leader, so_lead
 from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.recording_annotations import (
+    COLLECTOR_HUMAN,
+    COLLECTOR_POLICY,
     PHASE_CRITICAL,
     PHASE_PREFIX,
     SOURCE_HUMAN,
     SOURCE_VLA,
     resolve_collector_policy_id,
+    resolve_rlt_collector_policy_id,
 )
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import get_safe_torch_device, log_say
@@ -160,13 +163,14 @@ def record_loop(
     display_compressed_images: bool = False,
     policy_sync_executor: PolicySyncDualArmExecutor | None = None,
     intervention_state_machine_enabled: bool = True,
-    collector_policy_id_policy: str = "policy",
-    collector_policy_id_human: str = "human",
+    collector_policy_id_policy: int = COLLECTOR_POLICY,
+    collector_policy_id_human: int = COLLECTOR_HUMAN,
     acp_inference: ACPInferenceConfig | None = None,
     communication_retry_timeout_s: float = 2.0,
     communication_retry_interval_s: float = 0.1,
     rlt_online_collector: Any | None = None,
     critical_phase_tracker: Any | None = None,
+    rlt_intervention_tracker: Any | None = None,
 ):
     if acp_inference is None:
         acp_inference = ACPInferenceConfig()
@@ -321,6 +325,11 @@ def record_loop(
     _frame_idx = 0
     _cuda_cleanup_interval = 500  # defrag CUDA allocator every N frames
 
+    def get_episode_frame_index() -> int:
+        if dataset is None or dataset.episode_buffer is None:
+            return 0
+        return dataset.episode_buffer["size"]
+
     # Per-frame timing instrumentation → /tmp/frame_timing.csv
     _perf_fh = open("/tmp/frame_timing.csv", "w")  # noqa: SIM115
     _perf_fh.write("frame,total_ms,obs_ms,infer_ms,send_ms,dataset_ms,sleep_ms\n")
@@ -341,11 +350,15 @@ def record_loop(
                 if intervention_state == INTERVENTION_STATE_POLICY:
                     intervention_state = INTERVENTION_STATE_ACTIVE
                     set_teleop_manual_control(True)
+                    if rlt_intervention_tracker is not None:
+                        rlt_intervention_tracker.start(get_episode_frame_index())
                     if rlt is not None:
                         rlt.interrupt_chunk()
                         log_say("intervene", play_sounds=True)
                     logging.info("Intervention enabled (S1): teleop actions now override policy execution.")
                 else:
+                    if rlt_intervention_tracker is not None:
+                        rlt_intervention_tracker.stop(get_episode_frame_index())
                     intervention_state = INTERVENTION_STATE_RELEASE
                     set_teleop_manual_control(False)
                     if policy is not None and preprocessor is not None and postprocessor is not None:
@@ -404,6 +417,8 @@ def record_loop(
                 if critical_phase_tracker is not None and dataset is not None:
                     critical_phase_tracker.mark_success(dataset.episode_buffer["size"])
                 if intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE:
+                    if rlt_intervention_tracker is not None:
+                        rlt_intervention_tracker.stop(get_episode_frame_index())
                     intervention_state = INTERVENTION_STATE_RELEASE
                     set_teleop_manual_control(False)
                 log_say("success", play_sounds=True)
@@ -416,6 +431,8 @@ def record_loop(
                 if critical_phase_tracker is not None and dataset is not None:
                     critical_phase_tracker.mark_failure(dataset.episode_buffer["size"])
                 if intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE:
+                    if rlt_intervention_tracker is not None:
+                        rlt_intervention_tracker.stop(get_episode_frame_index())
                     intervention_state = INTERVENTION_STATE_RELEASE
                     set_teleop_manual_control(False)
                 log_say("failure", play_sounds=True)
@@ -550,7 +567,6 @@ def record_loop(
         rlt_phase = rlt_meta.phase if rlt_meta is not None else prev_phase
         rlt_source = SOURCE_HUMAN if is_intervention else (rlt_meta.source_type if rlt_meta else SOURCE_VLA)
         rlt_is_critical = float(rlt_phase == PHASE_CRITICAL)
-        rlt_is_handover = float(rlt_phase != prev_phase and rlt_phase == PHASE_CRITICAL)
 
         # Write to dataset
         if dataset is not None:
@@ -565,18 +581,21 @@ def record_loop(
             if "complementary_info.state" in dataset.features:
                 frame["complementary_info.state"] = np.array([intervention_state], dtype=np.float32)
             if "complementary_info.collector_policy_id" in dataset.features:
-                frame["complementary_info.collector_policy_id"] = resolve_collector_policy_id(
+                collector_code = resolve_collector_policy_id(
                     intervention_enabled=intervention_enabled,
                     is_intervention=bool(is_intervention),
                     selected_from_policy=selected_from_policy,
                     policy_id=collector_policy_id_policy,
                     human_id=collector_policy_id_human,
                 )
-            # Always populate RLT columns when they exist in the schema
+                if rlt is not None:
+                    collector_code = resolve_rlt_collector_policy_id(
+                        is_intervention=bool(is_intervention),
+                        source_type=rlt_source,
+                    )
+                frame["complementary_info.collector_policy_id"] = np.array([collector_code], dtype=np.int64)
             if "complementary_info.phase" in dataset.features:
                 frame["complementary_info.phase"] = np.array([rlt_phase], dtype=np.float32)
-                frame["complementary_info.source_type"] = np.array([rlt_source], dtype=np.float32)
-                frame["complementary_info.is_handover"] = np.array([rlt_is_handover], dtype=np.float32)
             prev_phase = rlt_phase
             _t0 = time.perf_counter()
             dataset.add_frame(frame)

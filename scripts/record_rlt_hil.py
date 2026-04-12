@@ -20,6 +20,18 @@ Data flow:
         → [SPACE] → Human intervention OFF, RL resumes
         → [s/f] → End CP, back to VLA
 
+Recorded annotation schema:
+    complementary_info.policy_action      - policy output before any human override
+    complementary_info.is_intervention    - 1 when human teleop overrides execution
+    complementary_info.state              - intervention state machine state
+    complementary_info.phase              - 0 prefix / 1 critical phase
+    complementary_info.collector_policy_id
+        0 = human, 1 = base policy, 2 = RLT actor
+
+Episode metadata:
+    rl_intervals                          - list of RL phase start/end frames
+    human_intervention_intervals          - list of human override start/end frames
+
 Usage (on zhaobo-4090-1, defaults match 278ep checkpoint):
     cd ~/code/hsy/Evo-RL
     conda activate evo-rl

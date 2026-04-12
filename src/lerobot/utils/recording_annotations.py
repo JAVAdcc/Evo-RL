@@ -34,6 +34,21 @@ SOURCE_VLA = 0.0
 SOURCE_RL = 1.0
 SOURCE_HUMAN = 2.0
 
+# Unified collector policy codes stored in `complementary_info.collector_policy_id`.
+COLLECTOR_HUMAN = 0
+COLLECTOR_POLICY = 1
+COLLECTOR_RLT_ACTOR = 2
+
+# Canonical RLT codebook used by `record_rlt_hil.py`.
+RLT_COLLECTOR_HUMAN = COLLECTOR_HUMAN
+RLT_COLLECTOR_PI05 = COLLECTOR_POLICY
+RLT_COLLECTOR_RLT_ACTOR = COLLECTOR_RLT_ACTOR
+RLT_COLLECTOR_POLICY_ID_TO_NAME = {
+    RLT_COLLECTOR_HUMAN: "human",
+    RLT_COLLECTOR_PI05: "pi0.5",
+    RLT_COLLECTOR_RLT_ACTOR: "pi_rlt_actor",
+}
+
 
 def normalize_episode_success_label(label: str | None) -> str | None:
     """Normalize a user-provided episode label to canonical lowercase values."""
@@ -105,10 +120,19 @@ def resolve_collector_policy_id(
     intervention_enabled: bool,
     is_intervention: bool,
     selected_from_policy: bool,
-    policy_id: str,
-    human_id: str,
-) -> str:
+    policy_id: int,
+    human_id: int,
+) -> int:
     """Resolve frame-level `collector_policy_id` from control mode and source."""
     if intervention_enabled:
         return human_id if is_intervention else policy_id
     return policy_id if selected_from_policy else human_id
+
+
+def resolve_rlt_collector_policy_id(*, is_intervention: bool, source_type: float) -> int:
+    """Resolve the RLT-specific numeric collector policy code for a single frame."""
+    if is_intervention:
+        return RLT_COLLECTOR_HUMAN
+    if source_type == SOURCE_RL:
+        return RLT_COLLECTOR_RLT_ACTOR
+    return RLT_COLLECTOR_PI05

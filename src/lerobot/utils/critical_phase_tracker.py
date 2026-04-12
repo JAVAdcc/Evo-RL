@@ -99,6 +99,17 @@ class CriticalPhaseTracker:
         """Return intervals filtered by outcome value."""
         return [iv for iv in self._intervals if iv[3] == outcome]
 
+    def get_episode_intervals(self, episode_idx: int) -> list[tuple[int, int, int, str | None]]:
+        """Return all intervals belonging to a single episode."""
+        return [iv for iv in self._intervals if iv[0] == episode_idx]
+
+    def serialize_episode_intervals(self, episode_idx: int) -> list[dict[str, int | str | None]]:
+        """Return episode-local intervals as JSON-friendly dicts."""
+        return [
+            {"start_frame": start, "end_frame": end, "outcome": outcome}
+            for _ep, start, end, outcome in self.get_episode_intervals(episode_idx)
+        ]
+
     def __len__(self) -> int:
         return len(self._intervals)
 
@@ -106,3 +117,64 @@ class CriticalPhaseTracker:
     def is_active(self) -> bool:
         """True if currently inside a critical phase (start pressed, end not yet)."""
         return self._current_start is not None
+
+
+class EpisodeIntervalTracker:
+    """Track repeated start/end frame intervals within each episode."""
+
+    def __init__(self, label: str):
+        self._label = label
+        self._intervals: list[tuple[int, int, int]] = []
+        self._current_start: int | None = None
+        self._current_episode: int = 0
+
+    def on_episode_start(self, episode_idx: int) -> None:
+        if self._current_start is not None:
+            logging.warning(
+                "Auto-closing unclosed %s at episode boundary (episode %d, from frame %d)",
+                self._label,
+                self._current_episode,
+                self._current_start,
+            )
+            self._current_start = None
+        self._current_episode = episode_idx
+
+    def start(self, frame_index: int) -> None:
+        if self._current_start is not None:
+            logging.warning("[%s] start called while already active", self._label)
+            return
+        self._current_start = frame_index
+        logging.info("[%s] START at episode %d, frame %d", self._label, self._current_episode, frame_index)
+
+    def stop(self, frame_index: int) -> None:
+        if self._current_start is None:
+            logging.warning("[%s] stop called but no active interval", self._label)
+            return
+        self._intervals.append((self._current_episode, self._current_start, frame_index))
+        logging.info(
+            "[%s] END at episode %d, frame %d (segment: %d-%d, %d frames)",
+            self._label,
+            self._current_episode,
+            frame_index,
+            self._current_start,
+            frame_index,
+            frame_index - self._current_start,
+        )
+        self._current_start = None
+
+    def on_episode_end(self, total_frames: int) -> None:
+        if self._current_start is None:
+            return
+        self.stop(total_frames)
+        logging.info("[%s] Auto-closed at episode %d, frame %d", self._label, self._current_episode, total_frames)
+
+    def discard_episode(self, episode_idx: int) -> None:
+        self._intervals = [iv for iv in self._intervals if iv[0] != episode_idx]
+        self._current_start = None
+
+    def serialize_episode_intervals(self, episode_idx: int) -> list[dict[str, int]]:
+        return [
+            {"start_frame": start, "end_frame": end}
+            for ep, start, end in self._intervals
+            if ep == episode_idx
+        ]

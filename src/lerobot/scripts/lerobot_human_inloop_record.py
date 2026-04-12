@@ -35,7 +35,6 @@ from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.recording_annotations import (
     EPISODE_FAILURE,
     EPISODE_SUCCESS,
-    infer_collector_policy_version,
 )
 
 
@@ -140,9 +139,6 @@ def human_inloop_record(cfg: RecordConfig):
     cfg.intervention_state_machine_enabled = cfg.policy is not None
     cfg.enable_episode_outcome_labeling = True
     cfg.default_episode_success = "failure"
-    cfg.enable_collector_policy_id = True
-    if cfg.collector_policy_id_policy is None:
-        cfg.collector_policy_id_policy = infer_collector_policy_version(cfg.policy)
     if cfg.policy is not None:
         failure_reset_controller = _HumanInloopFailureResetController(cfg)
         cfg._on_record_connected = failure_reset_controller.on_record_connected

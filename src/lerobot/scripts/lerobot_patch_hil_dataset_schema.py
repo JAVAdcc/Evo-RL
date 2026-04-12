@@ -25,7 +25,8 @@ import numpy as np
 from lerobot.configs import parser
 from lerobot.datasets.dataset_tools import add_features
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.scripts.lerobot_record import _ensure_human_inloop_compatible_features
+from lerobot.datasets.utils import write_info
+from lerobot.scripts.lerobot_record import _add_collector_policy_id_feature, _ensure_human_inloop_compatible_features
 from lerobot.utils.constants import ACTION
 from lerobot.utils.utils import init_logging
 
@@ -34,6 +35,8 @@ MISSING_HIL_FEATURES = (
     "complementary_info.policy_action",
     "complementary_info.is_intervention",
     "complementary_info.state",
+    "complementary_info.phase",
+    "complementary_info.collector_policy_id",
 )
 
 
@@ -45,7 +48,7 @@ class PatchHilDatasetSchemaConfig:
     output_dir: str | None = None
 
 
-def _build_missing_hil_features(dataset: LeRobotDataset) -> dict[str, tuple[np.ndarray, dict]]:
+def _build_missing_hil_features(dataset: LeRobotDataset) -> dict[str, tuple[object, dict]]:
     action_feature = dataset.features[ACTION]
     action_names = action_feature["names"]
     if action_names is None:
@@ -55,13 +58,16 @@ def _build_missing_hil_features(dataset: LeRobotDataset) -> dict[str, tuple[np.n
 
     feature_defs: dict[str, dict] = {}
     _ensure_human_inloop_compatible_features(feature_defs, action_feature_names=action_names)
+    _add_collector_policy_id_feature(feature_defs)
 
     num_frames = dataset.num_frames
     num_action_dims = len(action_names)
     values_by_feature = {
-        "complementary_info.policy_action": np.zeros((num_frames, num_action_dims), dtype=np.float32),
+        "complementary_info.policy_action": lambda *_args: np.zeros((num_action_dims,), dtype=np.float32),
         "complementary_info.is_intervention": np.zeros((num_frames, 1), dtype=np.float32),
         "complementary_info.state": np.zeros((num_frames, 1), dtype=np.float32),
+        "complementary_info.phase": np.zeros((num_frames, 1), dtype=np.float32),
+        "complementary_info.collector_policy_id": np.zeros((num_frames, 1), dtype=np.int64),
     }
 
     missing_features = {}
@@ -95,6 +101,11 @@ def patch_hil_dataset_schema(cfg: PatchHilDatasetSchemaConfig) -> LeRobotDataset
         output_dir=output_dir,
         repo_id=output_repo_id,
     )
+    collector_info = patched_dataset.meta.info["features"].get("complementary_info.collector_policy_id")
+    if collector_info is not None:
+        collector_info["info"] = {"codebook": {"0": "human"}}
+        patched_dataset.meta.info["recording_schema_version"] = 2
+        write_info(patched_dataset.meta.info, patched_dataset.root)
     logging.info("Patched dataset saved to %s", patched_dataset.root)
     return patched_dataset
 

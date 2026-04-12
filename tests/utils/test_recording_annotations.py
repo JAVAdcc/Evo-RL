@@ -19,13 +19,19 @@ from types import SimpleNamespace
 import pytest
 
 from lerobot.utils.recording_annotations import (
+    COLLECTOR_HUMAN,
+    COLLECTOR_POLICY,
+    COLLECTOR_RLT_ACTOR,
     EPISODE_FAILURE,
     EPISODE_SUCCESS,
+    SOURCE_RL,
+    SOURCE_VLA,
     infer_collector_policy_id,
     infer_collector_policy_version,
     normalize_episode_success_label,
     resolve_collector_policy_id,
     resolve_episode_success_label,
+    resolve_rlt_collector_policy_id,
 )
 
 
@@ -61,28 +67,34 @@ def test_resolve_collector_policy_id():
             intervention_enabled=True,
             is_intervention=True,
             selected_from_policy=True,
-            policy_id="act_v1",
-            human_id="human",
+            policy_id=COLLECTOR_POLICY,
+            human_id=COLLECTOR_HUMAN,
         )
-        == "human"
+        == COLLECTOR_HUMAN
     )
     assert (
         resolve_collector_policy_id(
             intervention_enabled=True,
             is_intervention=False,
             selected_from_policy=True,
-            policy_id="act_v1",
-            human_id="human",
+            policy_id=COLLECTOR_POLICY,
+            human_id=COLLECTOR_HUMAN,
         )
-        == "act_v1"
+        == COLLECTOR_POLICY
     )
     assert (
         resolve_collector_policy_id(
             intervention_enabled=False,
             is_intervention=False,
             selected_from_policy=False,
-            policy_id="act_v1",
-            human_id="human",
+            policy_id=COLLECTOR_POLICY,
+            human_id=COLLECTOR_HUMAN,
         )
-        == "human"
+        == COLLECTOR_HUMAN
     )
+
+
+def test_resolve_rlt_collector_policy_id():
+    assert resolve_rlt_collector_policy_id(is_intervention=True, source_type=SOURCE_VLA) == COLLECTOR_HUMAN
+    assert resolve_rlt_collector_policy_id(is_intervention=False, source_type=SOURCE_VLA) == COLLECTOR_POLICY
+    assert resolve_rlt_collector_policy_id(is_intervention=False, source_type=SOURCE_RL) == COLLECTOR_RLT_ACTOR
