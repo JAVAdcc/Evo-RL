@@ -264,6 +264,8 @@ def main():
             f"--rlt.actor_layer_norm={args.actor_layer_norm}",
             # Intervention via SPACE (configured in record() when rlt_hil_mode detected)
             "--intervention_state_machine_enabled=true",
+            # Leader follows policy actions; on intervention, follower follows leader
+            f"--policy_sync_to_teleop={'true' if teleop_argv else 'false'}",
             "--play_sounds=true",
         ]
 
