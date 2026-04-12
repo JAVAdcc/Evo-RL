@@ -183,6 +183,7 @@ def main():
 
     # Build teleop config for leader arms (needed for human intervention)
     teleop_argv = []
+    teleop_id = "bimanual_leader"
     if not args.no_teleop and len(leaders) >= 2:
         teleop_argv = [
             "--teleop.type=bi_so_leader",
@@ -190,14 +191,15 @@ def main():
             "--teleop.left_arm_config.use_degrees=true",
             f"--teleop.right_arm_config.port={leaders[1]['port']}",
             "--teleop.right_arm_config.use_degrees=true",
-            "--teleop.id=bimanual_leader",
+            f"--teleop.id={teleop_id}",
         ]
         log.info("Teleop enabled: left=%s, right=%s", leaders[0]["port"], leaders[1]["port"])
     else:
         log.warning("Teleop disabled — human intervention not available")
 
-    # Stage calibration files
+    # Stage calibration files for both followers and leaders
     with TemporaryDirectory(prefix="rlt-hil-") as cal_dir:
+        # Follower calibration
         for side, arm in [("left", followers[0]), ("right", followers[1])]:
             serial = Path(arm["calibration_dir"]).name
             src = Path(arm["calibration_dir"]).expanduser() / f"{serial}.json"
@@ -206,6 +208,21 @@ def main():
                 shutil.copy2(src, dst)
             else:
                 log.warning("Calibration file not found: %s", src)
+
+        # Leader calibration (BiSOLeader looks for {teleop_id}_{side}.json)
+        leader_cal_dir = None
+        if teleop_argv and len(leaders) >= 2:
+            leader_cal_dir = TemporaryDirectory(prefix="rlt-leader-cal-")
+            for side, arm in [("left", leaders[0]), ("right", leaders[1])]:
+                serial = Path(arm["calibration_dir"]).name
+                src = Path(arm["calibration_dir"]).expanduser() / f"{serial}.json"
+                dst = Path(leader_cal_dir.name) / f"{teleop_id}_{side}.json"
+                if src.exists():
+                    shutil.copy2(src, dst)
+                    log.info("Leader calibration staged: %s -> %s", src, dst)
+                else:
+                    log.warning("Leader calibration file not found: %s", src)
+            teleop_argv.append(f"--teleop.calibration_dir={leader_cal_dir.name}")
 
         # Build sys.argv for the @parser.wrap() decorated record()
         sys.argv = [
@@ -258,6 +275,9 @@ def main():
 
         from lerobot.scripts.lerobot_record import record
         record()
+
+    if leader_cal_dir is not None:
+        leader_cal_dir.cleanup()
 
     log.info("=== record_rlt_hil finished ===")
 
