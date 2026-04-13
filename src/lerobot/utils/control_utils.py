@@ -276,6 +276,97 @@ def _match_critical_phase_key(key, toggle_key: str, keyboard_module) -> bool:
     return hasattr(key, "char") and key.char and key.char.lower() == toggle_key.lower()
 
 
+def _start_pedal_listener(
+    events: dict[str, Any],
+    intervention_toggle_key: str,
+    critical_phase_toggle_key: str | None,
+    rl_phase_key: str | None,
+    cp_success_key: str | None,
+    cp_failure_key: str | None,
+    end_success_key: str | None,
+    end_failure_key: str | None,
+    episode_success_key: str | None,
+    episode_failure_key: str | None,
+):
+    """Attach a USB foot-pedal listener that feeds the same ``events`` dict
+    populated by the pynput/TTY keyboard listeners.
+
+    Pedal key presses are routed to the same events[] fields that the
+    corresponding keyboard keys would set, respecting the current key-parameter
+    wiring. The listener runs as a daemon thread and silently no-ops when no
+    compatible pedal device is available (or unreadable), so calling this
+    unconditionally is safe in any environment.
+
+    Returns the started PedalListener instance, or None if no pedal was found
+    or the evdev package is unavailable.
+    """
+    try:
+        from lerobot.utils.pedal_listener import PedalListener
+    except ImportError as e:
+        logging.info("Pedal listener unavailable (evdev not installed): %s", e)
+        return None
+
+    # Routing is data-driven: same semantics as the pynput on_press handler.
+    # First-registered wins for a given key to avoid overwriting rl_phase_key
+    # with e.g. a critical_phase_toggle_key that also happens to be 'r'.
+    def _normalize(k: str | None) -> str | None:
+        if k is None:
+            return None
+        return "space" if k == " " else k.lower()
+
+    routing: dict[str, str] = {}
+    cooldown_fields: set[str] = set()
+
+    def _register(key: str | None, field: str, cooldown: bool = False) -> None:
+        norm = _normalize(key)
+        if norm is None or norm in routing:
+            return
+        routing[norm] = field
+        if cooldown:
+            cooldown_fields.add(field)
+
+    _register(rl_phase_key, "start_rl_phase")
+    _register(intervention_toggle_key, "toggle_intervention", cooldown=True)
+    _register(critical_phase_toggle_key, "toggle_critical_phase", cooldown=True)
+    _register(cp_success_key, "cp_mark_success")
+    _register(cp_failure_key, "cp_mark_failure")
+    _register(end_success_key, "end_phase_success")
+    _register(end_failure_key, "end_phase_failure")
+    _register(episode_success_key, "episode_outcome_success")
+    _register(episode_failure_key, "episode_outcome_failure")
+
+    if not routing:
+        logging.info("No key parameters configured; pedal listener skipped")
+        return None
+
+    last_times: dict[str, float] = {}
+
+    def _on_pedal(key_name: str) -> None:
+        field = routing.get(key_name)
+        if not field:
+            return
+        if field in cooldown_fields:
+            now = time.monotonic()
+            if now - last_times.get(field, 0.0) < INTERVENTION_TOGGLE_COOLDOWN_S:
+                return
+            last_times[field] = now
+        logging.info("Pedal '%s' pressed -> events[%s] = True", key_name, field)
+        # Episode outcome is a value slot, not a boolean — write the final sentinel.
+        if field == "episode_outcome_success":
+            events["episode_outcome"] = EPISODE_SUCCESS
+            events["exit_early"] = True
+        elif field == "episode_outcome_failure":
+            events["episode_outcome"] = EPISODE_FAILURE
+            events["exit_early"] = True
+        else:
+            events[field] = True
+
+    pedal = PedalListener(on_press=_on_pedal)
+    if pedal.start():
+        return pedal
+    return None
+
+
 def init_keyboard_listener(
     intervention_toggle_key: str = "i",
     critical_phase_toggle_key: str | None = None,
@@ -315,6 +406,21 @@ def init_keyboard_listener(
     events["start_rl_phase"] = False
     events["end_phase_success"] = False
     events["end_phase_failure"] = False
+
+    # Attach optional USB foot-pedal listener. Works in all environments
+    # (pynput / TTY / fully headless); silently no-ops if the device is absent.
+    _start_pedal_listener(
+        events=events,
+        intervention_toggle_key=intervention_toggle_key,
+        critical_phase_toggle_key=critical_phase_toggle_key,
+        rl_phase_key=rl_phase_key,
+        cp_success_key=cp_success_key,
+        cp_failure_key=cp_failure_key,
+        end_success_key=end_success_key,
+        end_failure_key=end_failure_key,
+        episode_success_key=episode_success_key,
+        episode_failure_key=episode_failure_key,
+    )
 
     listener = None
     if not is_headless():
