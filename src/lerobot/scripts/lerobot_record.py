@@ -217,6 +217,15 @@ class RLTRecordConfig:
     rl_phase_key: str = "r"
     end_success_key: str = "s"
     end_failure_key: str = "f"
+    # wo_prefix mode: drop frames captured during PHASE_PREFIX (before RL phase
+    # starts). Used when the dataset should only contain the RL-driven segment.
+    skip_prefix_recording: bool = False
+    # wo_prefix mode: rl_phase_key toggles — first press starts the episode (and
+    # RL phase), second press ends the episode (sets exit_early). Single end
+    # press marks the episode as success; a follow-up press inside
+    # `rl_phase_double_tap_window_s` (default 1.0s) marks it as failure.
+    rl_phase_key_toggles_episode: bool = False
+    rl_phase_double_tap_window_s: float = 1.0
 
 
 @dataclass
@@ -636,6 +645,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     communication_retry_interval_s=cfg.communication_retry_interval_s,
                     critical_phase_tracker=critical_phase_tracker,
                     rlt_intervention_tracker=intervention_tracker,
+                    skip_prefix_recording=cfg.rlt.skip_prefix_recording,
+                    rl_phase_key_toggles_episode=cfg.rlt.rl_phase_key_toggles_episode,
+                    rl_phase_double_tap_window_s=cfg.rlt.rl_phase_double_tap_window_s,
                 )
 
                 if critical_phase_tracker is not None:

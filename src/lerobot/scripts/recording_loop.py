@@ -51,6 +51,8 @@ from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.recording_annotations import (
     COLLECTOR_HUMAN,
     COLLECTOR_POLICY,
+    EPISODE_FAILURE,
+    EPISODE_SUCCESS,
     PHASE_CRITICAL,
     PHASE_PREFIX,
     SOURCE_HUMAN,
@@ -171,6 +173,9 @@ def record_loop(
     rlt_online_collector: Any | None = None,
     critical_phase_tracker: Any | None = None,
     rlt_intervention_tracker: Any | None = None,
+    skip_prefix_recording: bool = False,
+    rl_phase_key_toggles_episode: bool = False,
+    rl_phase_double_tap_window_s: float = 1.0,
 ):
     if acp_inference is None:
         acp_inference = ACPInferenceConfig()
@@ -322,6 +327,9 @@ def record_loop(
     timestamp = 0
     start_episode_t = time.perf_counter()
     prev_phase = PHASE_PREFIX
+    rl_phase_started = False
+    pending_end_press_time: float | None = None
+    final_outcome: str | None = None
     _frame_idx = 0
     _cuda_cleanup_interval = 500  # defrag CUDA allocator every N frames
 
@@ -404,11 +412,40 @@ def record_loop(
         if events.get("start_rl_phase", False):
             events["start_rl_phase"] = False
             if rlt is not None:
-                rlt.set_rl_mode()
-                if critical_phase_tracker is not None and dataset is not None:
-                    critical_phase_tracker.toggle(dataset.episode_buffer["size"])
-                log_say("RL start", play_sounds=True)
-                logging.info("RL phase started (r key)")
+                if rl_phase_key_toggles_episode and rl_phase_started:
+                    # Toggle mode: 'r' presses after start drive a double-tap
+                    # state machine. First end-press starts a window; if the
+                    # window expires the episode is marked success. A second
+                    # press inside the window flips it to failure.
+                    if pending_end_press_time is None:
+                        pending_end_press_time = time.perf_counter()
+                        log_say("RL end", play_sounds=True)
+                        logging.info(
+                            "RL end pending — tap r again within %.1fs to mark failure",
+                            rl_phase_double_tap_window_s,
+                        )
+                    else:
+                        final_outcome = EPISODE_FAILURE
+                        events["exit_early"] = True
+                        log_say("failure", play_sounds=True)
+                        logging.info("RL phase ended via double-tap (failure)")
+                else:
+                    rlt.set_rl_mode()
+                    if critical_phase_tracker is not None and dataset is not None:
+                        critical_phase_tracker.toggle(dataset.episode_buffer["size"])
+                    rl_phase_started = True
+                    log_say("RL start", play_sounds=True)
+                    logging.info("RL phase started (r key)")
+
+        if (
+            pending_end_press_time is not None
+            and final_outcome is None
+            and (time.perf_counter() - pending_end_press_time) >= rl_phase_double_tap_window_s
+        ):
+            final_outcome = EPISODE_SUCCESS
+            events["exit_early"] = True
+            log_say("success", play_sounds=True)
+            logging.info("RL phase ended via single press (success)")
 
         if events.get("end_phase_success", False):
             events["end_phase_success"] = False
@@ -597,23 +634,25 @@ def record_loop(
             if "complementary_info.phase" in dataset.features:
                 frame["complementary_info.phase"] = np.array([rlt_phase], dtype=np.float32)
             prev_phase = rlt_phase
-            _t0 = time.perf_counter()
-            dataset.add_frame(frame)
-            _t_dataset = (time.perf_counter() - _t0) * 1000
+            skip_frame = skip_prefix_recording and rlt_phase == PHASE_PREFIX
+            if not skip_frame:
+                _t0 = time.perf_counter()
+                dataset.add_frame(frame)
+                _t_dataset = (time.perf_counter() - _t0) * 1000
 
-            # Write non-image fields to sidecar for crash recovery
-            if _recovery_fh is not None:
-                recovery_row = {}
-                for k, v in frame.items():
-                    if _is_image_key(k) or k == "task":
-                        continue
-                    if isinstance(v, np.ndarray):
-                        recovery_row[k] = v.tolist()
-                    elif isinstance(v, (int, float, str, bool)):
-                        recovery_row[k] = v
-                _recovery_fh.write(json.dumps(recovery_row) + "\n")
-                _recovery_fh.flush()
-                _frame_counter += 1
+                # Write non-image fields to sidecar for crash recovery
+                if _recovery_fh is not None:
+                    recovery_row = {}
+                    for k, v in frame.items():
+                        if _is_image_key(k) or k == "task":
+                            continue
+                        if isinstance(v, np.ndarray):
+                            recovery_row[k] = v.tolist()
+                        elif isinstance(v, (int, float, str, bool)):
+                            recovery_row[k] = v
+                    _recovery_fh.write(json.dumps(recovery_row) + "\n")
+                    _recovery_fh.flush()
+                    _frame_counter += 1
 
         if rlt_online_collector is not None:
             action_tensor = build_action_tensor(action_values)
@@ -653,6 +692,25 @@ def record_loop(
             _perf_fh.flush()
 
         timestamp = time.perf_counter() - start_episode_t
+
+    # Finalize toggle-mode episode end: stop intervention, switch RLT back to
+    # VLA mode, and tag both the critical phase interval and the episode with
+    # the resolved success/failure outcome.
+    if final_outcome is not None:
+        if intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE:
+            if rlt_intervention_tracker is not None:
+                rlt_intervention_tracker.stop(get_episode_frame_index())
+            intervention_state = INTERVENTION_STATE_RELEASE
+            set_teleop_manual_control(False)
+        if rlt is not None:
+            rlt.set_vla_mode()
+        if critical_phase_tracker is not None and dataset is not None:
+            ep_size = dataset.episode_buffer["size"]
+            if final_outcome == EPISODE_SUCCESS:
+                critical_phase_tracker.mark_success(ep_size)
+            else:
+                critical_phase_tracker.mark_failure(ep_size)
+        events["episode_outcome"] = final_outcome
 
     # Close timing file
     if _perf_fh is not None:
