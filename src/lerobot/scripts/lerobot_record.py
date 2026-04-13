@@ -621,12 +621,14 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         )
 
         with VideoEncodingManager(dataset):
-            # One-time policy warmup so the first RL transition pays no
-            # cold-start cost (CUDA kernel compile, KV cache alloc, buffer
-            # layout). Without this, pressing r for the first time in
-            # start_in_teleop mode stalls the robot for several seconds.
+            # One-time RL-path warmup so the first r press pays no cold-start
+            # cost (CUDA kernel compile, KV cache alloc, buffer layout). The
+            # warmup is driven through set_rl_mode() so the rlt policy
+            # exercises the RL actor codepath — VLA prefix forward runs only
+            # to produce prefix tokens (consumed by the RL token encoder),
+            # no VLA action chunk is ever queued or sent.
             if rlt_active and policy is not None and preprocessor is not None and postprocessor is not None:
-                log_say("Warming up policy", cfg.play_sounds)
+                log_say("Warming up RL path", cfg.play_sounds)
                 _warmup_obs = robot.get_observation()
                 _warmup_obs_processed = robot_observation_processor(_warmup_obs)
                 _warmup_frame = build_dataset_frame(
@@ -645,14 +647,11 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     robot_type=robot.robot_type,
                     acp_inference=cfg.acp_inference,
                 )
-                if hasattr(policy, "set_vla_mode"):
-                    policy.set_vla_mode()
-                if hasattr(policy, "interrupt_chunk"):
-                    policy.interrupt_chunk()
-                policy.reset()
-                preprocessor.reset()
-                postprocessor.reset()
-                log_say("Policy ready", cfg.play_sounds)
+                # Leave the policy in RL mode. recording_loop will call
+                # policy.reset() at episode start which resets the phase
+                # controller, so this only affects the warmup-to-first-reset
+                # gap where policy is never invoked.
+                log_say("Ready", cfg.play_sounds)
 
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
