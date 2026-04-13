@@ -11,6 +11,45 @@ Branch `shuyuan/rlt` implements the **RLT (RL Token)** pipeline from the paper *
 - Full session log: `docs/session_log_rlt_implementation.md`
 - Paper vs implementation comparison: `docs/实现对比.md` (gitignored)
 
+## Development machines and sync model
+
+This repo exists on 3 machines with strict role separation. **Do not edit code on the wrong machine** — this class of bug caused a multi-hour sync untangle in April 2026.
+
+| Role | Host | Path |
+|---|---|---|
+| Read-only mirror (Claude reads from here) | local mac | `/Users/shuyuan/code/Evo-RL-RLT` |
+| Data collection / recording / inference / robot | zhaobo-4090-1 (192.168.31.100, `ssh 100`) | `~/code/hsy/Evo-RL` |
+| Training / experiments / VLA | coder workspace (`coder-evo-rl-ssh`) | `/home/coder/share/Evo-RL-quick` |
+
+### Rules
+
+1. **Any code edit happens on the target deployment machine**, never on local mac. Local mac is strictly a read-only mirror for Claude to inspect the tree.
+2. **Task → target routing** (classify each task before starting):
+   - Robot, cameras, recording, `record_rlt_hil*`, `deploy_*`, `obs_bridge` → **zhaobo**
+   - VLA training, offline cache, demo adaptation, architecture search, training scripts → **coder**
+   - Pure reading / analysis / memory updates (no repo edits) → local mac is fine
+   - Ambiguous → **ask the user**, do not default to local
+3. **Fork (`Shiki42/Evo-RL` shuyuan/rlt) is the single source of truth.** Target machines push to fork. All other machines only `git fetch fork` + `git reset --hard fork/shuyuan/rlt`. No inter-machine git flows.
+4. **Local mac never commits or pushes to the repo.** (`CLAUDE.md` and `docs/rlt/*.md` are gitignored and may be edited locally as per-machine notes — but nothing else.)
+5. `coder` pushes to fork via SSH deploy key (`Host github-fork` in `~/.ssh/config`, remote URL `github-fork:Shiki42/Evo-RL.git`). Do not switch it back to https.
+
+### Opening ritual (every session)
+
+```bash
+cd /Users/shuyuan/code/Evo-RL-RLT
+git fetch fork
+git log --oneline -1 HEAD fork/shuyuan/rlt  # verify mirror is in sync
+git status                                    # must be clean
+```
+
+- If local has uncommitted edits → STOP and ask the user; a prior session violated the rule.
+- If local is behind fork → `git reset --hard fork/shuyuan/rlt`.
+- Before editing on a target machine → `git pull fork shuyuan/rlt` there first.
+
+### Why
+
+Edits scattered across local mac / zhaobo / coder create triangular divergence that requires manual rebase + stash shuffling + `skip-worktree` untangling to reconcile. Single-writer-per-target eliminates the whole class of problem.
+
 ## Architecture (actual, post-iteration)
 
 ```
