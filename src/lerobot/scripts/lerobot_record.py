@@ -231,6 +231,11 @@ class RLTRecordConfig:
     # double-tap window). Episode keeps going in VLA mode afterwards.
     rl_phase_key_toggles_critical_phase: bool = False
     rl_phase_double_tap_window_s: float = 0.6
+    # wo_prefix mode: start each episode in human-teleop state (leader drives
+    # follower, no policy actions sent) until the user presses the rl_phase_key
+    # to enter RL. Required for pure RL-only HIL recording where VLA should
+    # never drive the robot.
+    start_in_teleop: bool = False
 
 
 @dataclass
@@ -654,6 +659,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     rl_phase_key_toggles_episode=cfg.rlt.rl_phase_key_toggles_episode,
                     rl_phase_key_toggles_critical_phase=cfg.rlt.rl_phase_key_toggles_critical_phase,
                     rl_phase_double_tap_window_s=cfg.rlt.rl_phase_double_tap_window_s,
+                    start_in_teleop=cfg.rlt.start_in_teleop,
                 )
 
                 if critical_phase_tracker is not None:

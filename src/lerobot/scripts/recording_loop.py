@@ -177,6 +177,7 @@ def record_loop(
     rl_phase_key_toggles_episode: bool = False,
     rl_phase_key_toggles_critical_phase: bool = False,
     rl_phase_double_tap_window_s: float = 1.0,
+    start_in_teleop: bool = False,
 ):
     if acp_inference is None:
         acp_inference = ACPInferenceConfig()
@@ -228,7 +229,13 @@ def record_loop(
     rlt = policy if policy is not None and hasattr(policy, "set_rl_mode") else None
     has_autonomous_source = policy is not None
     intervention_enabled = intervention_state_machine_enabled and has_autonomous_source and has_teleop
-    intervention_state = INTERVENTION_STATE_POLICY
+    # start_in_teleop: episode begins in human-teleop mode (no policy actions
+    # are sent to the robot) until the user presses r to enter RL. Used by
+    # the wo_prefix HIL recorder where VLA should never drive.
+    if start_in_teleop and intervention_enabled:
+        intervention_state = INTERVENTION_STATE_ACTIVE
+    else:
+        intervention_state = INTERVENTION_STATE_POLICY
     last_teleop_action: RobotAction | None = None
     teleop_fallback_warned = False
 
@@ -265,8 +272,12 @@ def record_loop(
         uncond_policy_runtime_state = _capture_policy_runtime_state(policy)
 
     if intervention_enabled:
-        # Start in S0: policy drives both arms, teleop arm should accept feedback commands.
-        set_teleop_manual_control(False)
+        if intervention_state == INTERVENTION_STATE_ACTIVE:
+            # start_in_teleop mode: leader is backdrivable, follower mirrors leader.
+            set_teleop_manual_control(True)
+        else:
+            # S0: policy drives both arms, teleop arm should accept feedback commands.
+            set_teleop_manual_control(False)
 
     def run_with_connection_retry(action_name: str, fn: Callable[[], T]) -> T:
         timeout_s = max(communication_retry_timeout_s, 0.0)
@@ -415,9 +426,15 @@ def record_loop(
 
         if events.get("start_rl_phase", False):
             events["start_rl_phase"] = False
-            # Gate: block r-key while human teleop is actively overriding the
-            # policy. User must exit intervention (SPACE) before r works again.
-            if intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE:
+            # Gate: block r-key while the user is actively teleop-overriding
+            # an already-running RL phase. Pre-start teleop (start_in_teleop
+            # mode, rl_phase_started=False) must still allow r to fire so the
+            # user can transition from pre-episode teleop into RL.
+            if (
+                rl_phase_started
+                and intervention_enabled
+                and intervention_state == INTERVENTION_STATE_ACTIVE
+            ):
                 logging.info("Ignoring r key: human intervention is active")
             elif rlt is not None:
                 toggles_episode = rl_phase_key_toggles_episode
@@ -445,6 +462,12 @@ def record_loop(
                         log_say("failure", play_sounds=True)
                         logging.info("RL phase ended via double-tap (failure)")
                 else:
+                    # If we were in pre-start teleop (start_in_teleop mode),
+                    # release the teleop override so RL can drive. RELEASE is
+                    # auto-promoted to POLICY on the next frame (see below).
+                    if intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE:
+                        intervention_state = INTERVENTION_STATE_RELEASE
+                        set_teleop_manual_control(False)
                     rlt.set_rl_mode()
                     if critical_phase_tracker is not None and dataset is not None:
                         critical_phase_tracker.toggle(dataset.episode_buffer["size"])

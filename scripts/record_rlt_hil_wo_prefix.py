@@ -1,24 +1,26 @@
 """Record RLT HIL data without the VLA prefix segment.
 
-Variant of `record_rlt_hil.py` for online RL replay-buffer collection. Differences:
+Pure RL-only HIL recording for online replay-buffer collection:
 
-  * VLA still rolls out during the prefix phase (so the robot reaches the same
-    pre-RL state), but those frames are NOT written to the dataset.
-  * The episode boundary is the RL toggle key. First [r] press starts the
-    episode + RL phase; second [r] press ends the episode. There is no
-    explicit success/failure key during the RL phase.
-  * SPACE still toggles human intervention multiple times during the RL phase.
+  * VLA never drives the robot. Between episodes and before the first r key
+    of each episode the robot is in human-teleop mode (leader drives
+    follower). Press r to start an episode in RL mode.
+  * The episode boundary is the r key. First [r] press starts the episode +
+    RL phase; second [r] press ends the episode. Single end-press = success,
+    double-tap inside the window = failure. On episode end the robot goes
+    back to teleop so the human can reset the scene for the next episode.
+  * SPACE toggles human intervention during the RL phase. Exiting
+    intervention returns to RL (mode is preserved).
 
 `complementary_info.phase` and `rl_intervals` metadata are preserved so the
 existing offline-cache / replay-buffer plumbing keeps working.
 
 Keyboard controls during recording:
-    r     - First press: start episode + RL phase
-            Second press: end episode and mark SUCCESS (after a brief
-                          double-tap window — default 1.0s)
-            Second + third press inside the double-tap window: end
-                          episode and mark FAILURE
-    SPACE - Toggle human intervention during RL phase
+    r     - Pre-episode (teleop): start episode + enter RL phase
+            During RL phase: end episode, mark SUCCESS (single press)
+            During RL phase (double-tap inside window): mark FAILURE
+    SPACE - During RL phase: toggle human intervention (returns to RL)
+            Pre-episode: no effect (robot is already in teleop)
     →     - End current episode without an outcome label
     ←     - Discard and re-record episode
     ESC   - Stop all recording
@@ -259,6 +261,7 @@ def main():
             # wo_prefix mode flags
             "--rlt.skip_prefix_recording=true",
             "--rlt.rl_phase_key_toggles_episode=true",
+            "--rlt.start_in_teleop=true",
             f"--rlt.rl_phase_double_tap_window_s={args.double_tap_window_s}",
             # Episode outcome labeling so success/failure tags propagate to dataset metadata
             "--enable_episode_outcome_labeling=true",
@@ -273,9 +276,9 @@ def main():
         print(f"\nDataset: {dataset_name} -> {dataset_root}")
         print(f"Log: {log_file}")
         print(
-            "RLT HIL wo-prefix mode: r=start episode, "
-            "r=end success, r+r within "
-            f"{args.double_tap_window_s:.1f}s=end failure, SPACE=intervene"
+            "RLT HIL wo-prefix mode (pure RL): teleop→r=start RL episode; "
+            "in RL: r=end success, r+r within "
+            f"{args.double_tap_window_s:.1f}s=end failure, SPACE=intervene (returns to RL)"
         )
         print()
 
