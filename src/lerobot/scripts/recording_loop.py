@@ -175,6 +175,7 @@ def record_loop(
     rlt_intervention_tracker: Any | None = None,
     skip_prefix_recording: bool = False,
     rl_phase_key_toggles_episode: bool = False,
+    rl_phase_key_toggles_critical_phase: bool = False,
     rl_phase_double_tap_window_s: float = 1.0,
 ):
     if acp_inference is None:
@@ -363,6 +364,9 @@ def record_loop(
                     if rlt is not None:
                         rlt.interrupt_chunk()
                         log_say("intervene", play_sounds=True)
+                    # Cancel any pending r-key end-sequence on intervention enter:
+                    # user is clearly switching modes, don't auto-resolve.
+                    pending_end_press_time = None
                     logging.info("Intervention enabled (S1): teleop actions now override policy execution.")
                 else:
                     if rlt_intervention_tracker is not None:
@@ -411,12 +415,16 @@ def record_loop(
 
         if events.get("start_rl_phase", False):
             events["start_rl_phase"] = False
-            if rlt is not None:
-                if rl_phase_key_toggles_episode and rl_phase_started:
-                    # Toggle mode: 'r' presses after start drive a double-tap
-                    # state machine. First end-press starts a window; if the
-                    # window expires the episode is marked success. A second
-                    # press inside the window flips it to failure.
+            # Gate: block r-key while human teleop is actively overriding the
+            # policy. User must exit intervention (SPACE) before r works again.
+            if intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE:
+                logging.info("Ignoring r key: human intervention is active")
+            elif rlt is not None:
+                toggles_episode = rl_phase_key_toggles_episode
+                toggles_cp = rl_phase_key_toggles_critical_phase
+                if (toggles_episode or toggles_cp) and rl_phase_started:
+                    # Double-tap state machine. First end-press opens a window;
+                    # window expiry = success, second press inside window = failure.
                     if pending_end_press_time is None:
                         pending_end_press_time = time.perf_counter()
                         log_say("RL end", play_sounds=True)
@@ -425,8 +433,15 @@ def record_loop(
                             rl_phase_double_tap_window_s,
                         )
                     else:
-                        final_outcome = EPISODE_FAILURE
-                        events["exit_early"] = True
+                        if toggles_episode:
+                            final_outcome = EPISODE_FAILURE
+                            events["exit_early"] = True
+                        else:  # toggles_cp
+                            rlt.set_vla_mode()
+                            if critical_phase_tracker is not None and dataset is not None:
+                                critical_phase_tracker.mark_failure(dataset.episode_buffer["size"])
+                            rl_phase_started = False
+                        pending_end_press_time = None
                         log_say("failure", play_sounds=True)
                         logging.info("RL phase ended via double-tap (failure)")
                 else:
@@ -434,6 +449,7 @@ def record_loop(
                     if critical_phase_tracker is not None and dataset is not None:
                         critical_phase_tracker.toggle(dataset.episode_buffer["size"])
                     rl_phase_started = True
+                    pending_end_press_time = None
                     log_say("RL start", play_sounds=True)
                     logging.info("RL phase started (r key)")
 
@@ -441,9 +457,17 @@ def record_loop(
             pending_end_press_time is not None
             and final_outcome is None
             and (time.perf_counter() - pending_end_press_time) >= rl_phase_double_tap_window_s
+            and not (intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE)
         ):
-            final_outcome = EPISODE_SUCCESS
-            events["exit_early"] = True
+            if rl_phase_key_toggles_episode:
+                final_outcome = EPISODE_SUCCESS
+                events["exit_early"] = True
+            elif rl_phase_key_toggles_critical_phase and rlt is not None:
+                rlt.set_vla_mode()
+                if critical_phase_tracker is not None and dataset is not None:
+                    critical_phase_tracker.mark_success(dataset.episode_buffer["size"])
+                rl_phase_started = False
+            pending_end_press_time = None
             log_say("success", play_sounds=True)
             logging.info("RL phase ended via single press (success)")
 

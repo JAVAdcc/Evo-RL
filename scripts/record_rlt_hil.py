@@ -5,10 +5,12 @@ the lerobot record() function with RLTPretrainedPolicy as the action source.
 RLT config is translated into a standard policy via RLTPretrainedConfig.
 
 Keyboard controls during recording:
-    r     - Start RL critical phase (switch to RL actor)
-    SPACE - Toggle human intervention during RL phase
-    s     - End critical phase (mark success), switch back to VLA
-    f     - End critical phase (mark failure), switch back to VLA
+    r     - First press: start RL critical phase (switch to RL actor)
+            Second press: end RL, mark critical phase as SUCCESS, back to VLA
+            Second press + third press within the double-tap window: mark
+                          critical phase as FAILURE instead
+            Blocked while human intervention is active (exit SPACE first)
+    SPACE - Toggle human intervention (preserves RL/VLA mode on exit)
     →     - End current episode
     ←     - Discard and re-record episode
     ESC   - Stop all recording
@@ -16,9 +18,10 @@ Keyboard controls during recording:
 Data flow:
     Default: VLA prefix phase, VLA drives actions
       → [r] → Critical phase, RL actor drives
-        → [SPACE] → Human teleop intervention ON
+        → [SPACE] → Human teleop intervention ON (returns to RL on exit)
         → [SPACE] → Human intervention OFF, RL resumes
-        → [s/f] → End CP, back to VLA
+        → [r] → End RL, back to VLA; single = success, double-tap = failure
+      → [r again] → another RL phase may be started in the same episode
 
 Recorded annotation schema:
     complementary_info.policy_action      - policy output before any human override
@@ -104,6 +107,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--vcodec", default="h264")
     p.add_argument("--no-teleop", action="store_true", default=False,
                     help="Skip leader arm teleop (disables human intervention)")
+    p.add_argument("--double-tap-window-s", type=float, default=0.6,
+                    help="Window after first r-end press inside which a second r tap marks the critical phase as failure")
     p.add_argument("--log-level", default="INFO")
     return p.parse_args()
 
@@ -262,6 +267,9 @@ def main():
             f"--rlt.actor_residual={args.actor_residual}",
             f"--rlt.actor_activation={args.actor_activation}",
             f"--rlt.actor_layer_norm={args.actor_layer_norm}",
+            # r-key toggles critical phase only (episode keeps going in VLA after RL ends)
+            "--rlt.rl_phase_key_toggles_critical_phase=true",
+            f"--rlt.rl_phase_double_tap_window_s={args.double_tap_window_s}",
             # Intervention via SPACE (configured in record() when rlt_hil_mode detected)
             "--intervention_state_machine_enabled=true",
             # Leader follows policy actions; on intervention, follower follows leader
@@ -272,7 +280,10 @@ def main():
         log.info("Calling record() with %d argv entries", len(sys.argv))
         print(f"\nDataset: {dataset_name} -> {dataset_root}")
         print(f"Log: {log_file}")
-        print("RLT HIL mode: r=RL, SPACE=intervene, s=success, f=failure")
+        print(
+            "RLT HIL mode: r=start RL; r again=end RL (success); "
+            f"r double-tap within {args.double_tap_window_s:.1f}s=end RL (failure); SPACE=intervene"
+        )
         print()
 
         from lerobot.scripts.lerobot_record import record

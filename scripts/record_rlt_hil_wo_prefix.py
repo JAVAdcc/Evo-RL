@@ -99,7 +99,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--vcodec", default="h264")
     p.add_argument("--no-teleop", action="store_true", default=False,
                     help="Skip leader arm teleop (disables human intervention)")
-    p.add_argument("--double-tap-window-s", type=float, default=1.0,
+    p.add_argument("--double-tap-window-s", type=float, default=0.6,
                     help="Window for second 'r' press to mark failure instead of success")
     p.add_argument("--log-level", default="INFO")
     return p.parse_args()

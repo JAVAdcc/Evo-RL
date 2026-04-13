@@ -223,9 +223,14 @@ class RLTRecordConfig:
     # wo_prefix mode: rl_phase_key toggles — first press starts the episode (and
     # RL phase), second press ends the episode (sets exit_early). Single end
     # press marks the episode as success; a follow-up press inside
-    # `rl_phase_double_tap_window_s` (default 1.0s) marks it as failure.
+    # `rl_phase_double_tap_window_s` marks it as failure.
     rl_phase_key_toggles_episode: bool = False
-    rl_phase_double_tap_window_s: float = 1.0
+    # With-prefix mode: rl_phase_key toggles the critical phase only — first
+    # press starts RL, second press ends RL and marks the critical phase
+    # (success by default, failure if a second press lands inside the
+    # double-tap window). Episode keeps going in VLA mode afterwards.
+    rl_phase_key_toggles_critical_phase: bool = False
+    rl_phase_double_tap_window_s: float = 0.6
 
 
 @dataclass
@@ -647,6 +652,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     rlt_intervention_tracker=intervention_tracker,
                     skip_prefix_recording=cfg.rlt.skip_prefix_recording,
                     rl_phase_key_toggles_episode=cfg.rlt.rl_phase_key_toggles_episode,
+                    rl_phase_key_toggles_critical_phase=cfg.rlt.rl_phase_key_toggles_critical_phase,
                     rl_phase_double_tap_window_s=cfg.rlt.rl_phase_double_tap_window_s,
                 )
 
