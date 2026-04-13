@@ -241,6 +241,9 @@ def main():
             f"--dataset.fps={args.fps}",
             f"--dataset.vcodec={args.vcodec}",
             "--dataset.push_to_hub=false",
+            # Defer video encoding to end-of-recording so mid-session pauses
+            # go away — one bulk encode at finalize instead of one per episode.
+            f"--dataset.video_encoding_batch_size={args.num_episodes + 1}",
             # RLT config
             "--rlt.enable=true",
             f"--rlt.vla_model={args.vla_model}",

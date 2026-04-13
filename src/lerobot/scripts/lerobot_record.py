@@ -78,7 +78,7 @@ from lerobot.configs import parser
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
-from lerobot.datasets.utils import combine_feature_dicts, write_info
+from lerobot.datasets.utils import build_dataset_frame, combine_feature_dicts, write_info
 from lerobot.datasets.video_utils import VideoEncodingManager
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.processor import make_default_processors
@@ -121,7 +121,7 @@ from lerobot.teleoperators import (  # noqa: F401
     so_leader,
     unitree_g1,
 )
-from lerobot.utils.constants import ACTION
+from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.control_utils import (
     init_keyboard_listener,
     is_headless,
@@ -139,6 +139,7 @@ from lerobot.utils.recording_annotations import (
     resolve_episode_success_label,
 )
 from lerobot.utils.utils import (
+    get_safe_torch_device,
     init_logging,
     log_say,
 )
@@ -620,6 +621,39 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         )
 
         with VideoEncodingManager(dataset):
+            # One-time policy warmup so the first RL transition pays no
+            # cold-start cost (CUDA kernel compile, KV cache alloc, buffer
+            # layout). Without this, pressing r for the first time in
+            # start_in_teleop mode stalls the robot for several seconds.
+            if rlt_active and policy is not None and preprocessor is not None and postprocessor is not None:
+                log_say("Warming up policy", cfg.play_sounds)
+                _warmup_obs = robot.get_observation()
+                _warmup_obs_processed = robot_observation_processor(_warmup_obs)
+                _warmup_frame = build_dataset_frame(
+                    dataset.features, _warmup_obs_processed, prefix=OBS_STR
+                )
+                if hasattr(policy, "set_rl_mode"):
+                    policy.set_rl_mode()
+                _predict_policy_action_with_acp_inference(
+                    observation_frame=_warmup_frame,
+                    policy=policy,
+                    device=get_safe_torch_device(policy.config.device),
+                    preprocessor=preprocessor,
+                    postprocessor=postprocessor,
+                    use_amp=policy.config.use_amp,
+                    task=cfg.dataset.single_task,
+                    robot_type=robot.robot_type,
+                    acp_inference=cfg.acp_inference,
+                )
+                if hasattr(policy, "set_vla_mode"):
+                    policy.set_vla_mode()
+                if hasattr(policy, "interrupt_chunk"):
+                    policy.interrupt_chunk()
+                policy.reset()
+                preprocessor.reset()
+                postprocessor.reset()
+                log_say("Policy ready", cfg.play_sounds)
+
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
                 events["episode_outcome"] = None
