@@ -1,553 +1,536 @@
 #!/usr/bin/env python3
-"""Visualize VLA action predictions vs ground truth for a dataset episode.
-
-Loads a LeRobot dataset episode and runs pi0.5 (and optionally RLT) inference
-on each frame, then generates an interactive HTML page showing action curves
-in a 30-frame sliding window with a scrub bar.
-
-Usage:
-    PYTHONPATH=src python scripts/visualize_vla_actions.py \
-        --dataset-path /path/to/dataset \
-        --vla-model /path/to/pi05_sft \
-        --stride 1 --output action_viz.html
-
-    # With RLT:
-    PYTHONPATH=src python scripts/visualize_vla_actions.py \
-        --dataset-path /path/to/dataset \
-        --vla-model /path/to/pi05_sft \
-        --rl-token-ckpt checkpoints/rlt/demo_adapt_checkpoint.pt \
-        --ac-ckpt checkpoints/rlt/rl_checkpoint.pt \
-        --actor-hidden-dim 512 --actor-num-layers 4 \
-        --stride 1 --output action_viz.html
-"""
 from __future__ import annotations
 
 import argparse
 import json
 import logging
-import os
 import sys
 import time
-from copy import copy
+from dataclasses import dataclass
 from pathlib import Path
-
-# Block all HF network requests (no internet on target machine)
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["HF_DATASETS_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 import numpy as np
 import torch
+from huggingface_hub import hf_hub_download
 from tqdm import tqdm
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT / "src") not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT / "src"))
+SRC_ROOT = REPO_ROOT / "src"
+TRAINING_ROOT = REPO_ROOT / "scripts" / "rlt_training"
+for root in [SRC_ROOT, TRAINING_ROOT]:
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+
+from common import build_pi05_policy, load_training_config
 
 log = logging.getLogger(__name__)
 
 JOINT_TYPES = [
-    "shoulder_pan", "shoulder_lift", "elbow_flex",
-    "wrist_flex", "wrist_roll", "gripper",
+    "shoulder_pan",
+    "shoulder_lift",
+    "elbow_flex",
+    "wrist_flex",
+    "wrist_roll",
+    "gripper",
 ]
-DEFAULT_JOINT_NAMES = (
-    [f"left_{j}.pos" for j in JOINT_TYPES] + [f"right_{j}.pos" for j in JOINT_TYPES]
-)
-DEFAULT_CAMERA_KEYS = ["left_wrist", "right_wrist", "right_front"]
-WINDOW = 30  # frames per visible window
+WINDOW = 60
+DEFAULT_VLA_MODEL = "Elvinky/pi05_screw_271ep_sft_fp32"
+DEFAULT_HF_REPO = "Shiki42/rlt_pi0.5_screw"
+DEFAULT_RL_TOKEN_PATH = "rl_token/271ep_pi0.5_screw_sft_rltoken/demo_adapt_checkpoint.pt"
+DEFAULT_RL_CONFIG_PATH = "rl_token/271ep_pi0.5_screw_sft_rltoken/pi05_rlt.yaml"
+DEFAULT_AC_PATH = "rl_token/271ep_pi0.5_screw_sft_rltoken/actor_critic/0412_278cp_warmup/rl_checkpoint.pt"
+DEFAULT_AC_METRICS_PATH = "rl_token/271ep_pi0.5_screw_sft_rltoken/actor_critic/0412_278cp_warmup/metrics.json"
+COLORS = {
+    "gt_left": "#1f4e79",
+    "gt_right": "#6fa8dc",
+    "vla_left": "#7f6000",
+    "vla_right": "#f6b26b",
+    "rl_left": "#274e13",
+    "rl_right": "#93c47d",
+}
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+@dataclass
+class RLModelPaths:
+    rl_token_ckpt: str
+    ac_ckpt: str
+    config_path: str
+    metrics_path: str
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Visualize VLA action predictions")
-    p.add_argument("--dataset-path", type=str, required=True)
-    p.add_argument("--episode-index", type=int, default=0)
-    p.add_argument("--vla-model", type=str, required=True)
-    p.add_argument("--rl-token-ckpt", type=str, default="")
-    p.add_argument("--ac-ckpt", type=str, default="")
-    p.add_argument("--task", type=str, default="Insert the copper screw into the black sleeve.")
-    p.add_argument("--output", type=str, default="action_viz.html")
-    p.add_argument("--device", type=str, default="cuda")
-    p.add_argument("--stride", type=int, default=1)
-    p.add_argument("--repo-id", type=str, default="viz_dataset")
-    p.add_argument("--tokenizer-path", type=str, default=None)
-    p.add_argument("--log-level", type=str, default="INFO")
-    p.add_argument("--actor-hidden-dim", type=int, default=256)
-    p.add_argument("--actor-num-layers", type=int, default=3)
-    p.add_argument("--actor-residual", action="store_true", default=True)
-    p.add_argument("--actor-activation", type=str, default="relu")
-    return p.parse_args()
-
-
-# ---------------------------------------------------------------------------
-# Dataset
-# ---------------------------------------------------------------------------
-
-
-def load_dataset(dataset_path: str, repo_id: str, episode_index: int):
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
-    # Temporarily allow HF hub access for local dataset metadata loading
-    saved = {k: os.environ.pop(k, None) for k in ["HF_HUB_OFFLINE", "HF_DATASETS_OFFLINE"]}
-    ds = LeRobotDataset(
-        repo_id=repo_id, root=dataset_path,
-        episodes=[episode_index], video_backend="pyav",
+    parser = argparse.ArgumentParser(
+        description="Visualize GT/VLA/RL actions using the same inference path as RLT training.",
     )
-    for k, v in saved.items():
-        if v is not None:
-            os.environ[k] = v
-    return ds
+    parser.add_argument("--dataset-path", required=True, help="Local LeRobot dataset root.")
+    parser.add_argument(
+        "--episode-index",
+        type=int,
+        default=-1,
+        help="-1 means choose the longest episode. Non-negative values use that episode index.",
+    )
+    parser.add_argument("--repo-id", default="rlt_viz")
+    parser.add_argument("--output", default="action_viz.html")
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--task", default="Insert the copper screw into the black sleeve.")
+    parser.add_argument("--stride", type=int, default=1)
+    parser.add_argument("--window-size", type=int, default=WINDOW)
+    parser.add_argument("--log-level", default="INFO")
+    parser.add_argument(
+        "--action-space",
+        choices=["normalized", "raw"],
+        default="normalized",
+        help="Plot in training space or unnormalized physical space.",
+    )
+    parser.add_argument("--vla-model", default=DEFAULT_VLA_MODEL)
+    parser.add_argument("--config", default="")
+    parser.add_argument("--token-pool-size", type=int, default=64)
+    parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float32"])
+    parser.add_argument("--no-rl", action="store_true")
+    parser.add_argument("--hf-repo", default=DEFAULT_HF_REPO)
+    parser.add_argument("--rl-token-ckpt", default="")
+    parser.add_argument("--ac-ckpt", default="")
+    parser.add_argument("--ac-metrics", default="")
+    return parser.parse_args()
 
 
-def detect_camera_keys(dataset) -> list[str]:
-    prefix = "observation.images."
-    return [k.removeprefix(prefix) for k in dataset.features if k.startswith(prefix)]
+def resolve_hf_file(repo_id: str, path_in_repo: str) -> str:
+    return hf_hub_download(repo_id=repo_id, filename=path_in_repo)
 
 
-# ---------------------------------------------------------------------------
-# Unnormalize: QUANTILES mode (q01, q99) -> original space
-# ---------------------------------------------------------------------------
+def resolve_rl_model_paths(args: argparse.Namespace) -> RLModelPaths:
+    return RLModelPaths(
+        rl_token_ckpt=args.rl_token_ckpt or resolve_hf_file(args.hf_repo, DEFAULT_RL_TOKEN_PATH),
+        ac_ckpt=args.ac_ckpt or resolve_hf_file(args.hf_repo, DEFAULT_AC_PATH),
+        config_path=args.config or resolve_hf_file(args.hf_repo, DEFAULT_RL_CONFIG_PATH),
+        metrics_path=args.ac_metrics or resolve_hf_file(args.hf_repo, DEFAULT_AC_METRICS_PATH),
+    )
+
+
+def load_demo_dataset(dataset_path: str, repo_id: str, chunk_length: int):
+    from lerobot.rlt.demo_loader import RLTDemoDataset
+
+    return RLTDemoDataset(
+        dataset_path=dataset_path,
+        repo_id=repo_id,
+        chunk_length=chunk_length,
+        normalize_actions=True,
+    )
+
+
+def select_episode(dataset, episode_index: int) -> tuple[int, list[int]]:
+    from lerobot.rlt.offline_dataset import _count_episodes, _episode_frame_range
+
+    num_episodes = _count_episodes(dataset)
+    if episode_index >= num_episodes:
+        raise ValueError(f"episode_index={episode_index} out of range for {num_episodes} episodes")
+
+    if episode_index >= 0:
+        start, stop = _episode_frame_range(dataset, episode_index)
+        return episode_index, list(range(start, stop))
+
+    longest: tuple[int, int, int] | None = None
+    for ep_idx in range(num_episodes):
+        start, stop = _episode_frame_range(dataset, ep_idx)
+        length = stop - start
+        candidate = (length, ep_idx, start)
+        if longest is None or candidate > longest:
+            longest = candidate
+
+    if longest is None:
+        raise ValueError("dataset has no episodes")
+
+    length, ep_idx, start = longest
+    return ep_idx, list(range(start, start + length))
 
 
 def load_action_quantiles(dataset) -> tuple[np.ndarray, np.ndarray]:
-    """Load q01 and q99 from dataset stats for action unnormalization."""
-    stats = dataset.meta.stats["action"]
+    stats = dataset._dataset.meta.stats["action"]
     q01 = stats["q01"].numpy() if isinstance(stats["q01"], torch.Tensor) else np.array(stats["q01"])
     q99 = stats["q99"].numpy() if isinstance(stats["q99"], torch.Tensor) else np.array(stats["q99"])
-    return q01, q99
+    return q01[:12], q99[:12]
 
 
 def unnormalize_actions(actions: np.ndarray, q01: np.ndarray, q99: np.ndarray) -> np.ndarray:
-    """Inverse of QUANTILES normalization: [-1, 1] -> original range via q01/q99."""
     return (actions + 1.0) / 2.0 * (q99 - q01) + q01
 
 
-# ---------------------------------------------------------------------------
-# Observation conversion
-# ---------------------------------------------------------------------------
+def convert_action_space(actions: np.ndarray, action_space: str, q01: np.ndarray, q99: np.ndarray) -> np.ndarray:
+    if action_space == "normalized":
+        return actions
+    return unnormalize_actions(actions, q01, q99)
 
 
-def item_to_numpy_obs(item: dict, camera_full_keys: list[str]) -> dict[str, np.ndarray]:
-    obs: dict[str, np.ndarray] = {}
-    for full_key in camera_full_keys:
-        img = item[full_key]
-        obs[full_key] = (img.permute(1, 2, 0) * 255).byte().numpy()
-    obs["observation.state"] = item["observation.state"].numpy()
-    return obs
+def load_ac_metadata(ac_ckpt_path: str, metrics_path: str) -> tuple[dict, dict]:
+    from lerobot.rlt.utils import infer_actor_architecture
+
+    ac_ckpt = torch.load(ac_ckpt_path, map_location="cpu", weights_only=False)
+    metrics = json.loads(Path(metrics_path).read_text())
+    inferred = infer_actor_architecture(ac_ckpt["actor_state_dict"])
+    return ac_ckpt, metrics.get("config", {}) or inferred
 
 
-
-# ---------------------------------------------------------------------------
-# Pi0.5 inference
-# ---------------------------------------------------------------------------
-
-
-def load_pi05_policy(vla_model: str, dataset, device: str):
-    from lerobot.configs.policies import PreTrainedConfig
-    from lerobot.policies.factory import make_policy, make_pre_post_processors
-    from lerobot.processor.rename_processor import rename_stats
-
-    cfg = PreTrainedConfig.from_pretrained(vla_model)
-    cfg.pretrained_path = vla_model
-    cfg.device = device
-    policy = make_policy(cfg, ds_meta=dataset.meta)
-    policy.eval()
-    preprocessor, _ = make_pre_post_processors(
-        policy_cfg=cfg, pretrained_path=vla_model,
-        dataset_stats=rename_stats(dataset.meta.stats, {}),
-    )
-    return policy, preprocessor
-
-
-def run_pi05_inference(
-    policy, preprocessor, dataset, camera_full_keys: list[str],
-    task: str, device: str, stride: int,
-) -> np.ndarray:
-    """Returns (N, action_dim) in NORMALIZED [-1,1] space."""
-    from lerobot.policies.utils import prepare_observation_for_inference
-
-    actions = []
-    frame_indices = list(range(0, len(dataset), stride))
-    log.info("pi0.5: %d frames (stride=%d)", len(frame_indices), stride)
-
-    t0 = time.monotonic()
-    for idx in tqdm(frame_indices, desc="pi0.5"):
-        item = dataset[idx]
-        obs_np = item_to_numpy_obs(item, camera_full_keys)
-        obs_prepared = prepare_observation_for_inference(copy(obs_np), torch.device(device), task)
-        obs_prepared = preprocessor(obs_prepared)
-        policy._action_queue.clear()
-        with torch.inference_mode(), torch.autocast(device_type="cuda", enabled=(device == "cuda")):
-            chunk = policy.predict_action_chunk(obs_prepared)
-        actions.append(chunk[0, 0, :].cpu().numpy())
-
-    elapsed = time.monotonic() - t0
-    log.info("pi0.5 done: %.1fs (%.0f ms/frame)", elapsed, elapsed / max(len(actions), 1) * 1000)
-    return np.array(actions)
-
-
-# ---------------------------------------------------------------------------
-# RLT inference
-# ---------------------------------------------------------------------------
-
-
-def load_rlt_policy(args: argparse.Namespace):
-    """Load RLT: Pi05VLAAdapter + RLTPolicy with RL token + actor checkpoints."""
-    from lerobot.rlt.config import ActorConfig, CriticConfig, RLTConfig, RLTokenConfig
-    from lerobot.rlt.pi05_adapter import Pi05VLAAdapter
-    from lerobot.rlt.policy import RLTPolicy
+def build_policy(args: argparse.Namespace, config_path: str, rl_paths: RLModelPaths | None):
     from lerobot.rlt.utils import filter_encoder_only, infer_actor_architecture
 
-    ac_ckpt = torch.load(args.ac_ckpt, map_location="cpu", weights_only=False)
-    ac_config = ac_ckpt.get("config", {})
-    actor_kwargs = infer_actor_architecture(
-        ac_ckpt["actor_state_dict"],
-        default_activation=args.actor_activation,
-        default_fixed_std=0.05,
-        default_ref_dropout_p=0.5,
-    )
-    actor_kwargs["hidden_dim"] = ac_config.get("actor_hidden", actor_kwargs["hidden_dim"])
-    actor_kwargs["num_layers"] = ac_config.get("actor_layers", actor_kwargs["num_layers"])
-    actor_kwargs["activation"] = ac_config.get("activation", actor_kwargs["activation"])
-    actor_kwargs["residual"] = ac_config.get("architecture", "") == "residual_mlp" or actor_kwargs["residual"]
-    if not ac_config:
-        log.warning("AC checkpoint has no config metadata; activation/fixed_std fall back to script defaults")
+    config = load_training_config(config_path or None)
+    if rl_paths is not None:
+        ac_ckpt, ac_metadata = load_ac_metadata(rl_paths.ac_ckpt, rl_paths.metrics_path)
+        inferred = infer_actor_architecture(ac_ckpt["actor_state_dict"])
+        config.actor.hidden_dim = int(ac_metadata.get("actor_hidden", inferred["hidden_dim"]))
+        config.actor.num_layers = int(ac_metadata.get("actor_layers", inferred["num_layers"]))
+        config.actor.activation = str(ac_metadata.get("actor_activation", inferred["activation"]))
+        config.actor.layer_norm = bool(ac_metadata.get("actor_layer_norm", inferred["layer_norm"]))
+        config.actor.residual = bool(ac_metadata.get("actor_residual", inferred["residual"]))
+        config.actor.fixed_std = float(ac_metadata.get("fixed_std", inferred["fixed_std"]))
+        config.actor.ref_dropout_p = float(ac_metadata.get("ref_dropout_p", inferred["ref_dropout_p"]))
+        rl_token_ckpt = rl_paths.rl_token_ckpt
+    else:
+        ac_ckpt = None
+        rl_token_ckpt = None
 
-    vla = Pi05VLAAdapter(
+    policy = build_pi05_policy(
+        config=config,
         model_path=args.vla_model,
-        actual_action_dim=12, actual_proprio_dim=12,
         task_instruction=args.task,
-        device=args.device, token_pool_size=64,
-        tokenizer_path=args.tokenizer_path,
+        device=args.device,
+        token_pool_size=args.token_pool_size,
+        dtype=args.dtype,
+        rl_token_checkpoint=rl_token_ckpt,
     )
-    rlt_config = RLTConfig(
-        action_dim=12, proprio_dim=12, chunk_length=10,
-        rl_token=RLTokenConfig(token_dim=2048, nhead=8, enc_layers=3, dec_layers=3, ff_dim=4096, num_rl_tokens=4),
-        actor=ActorConfig(
-            hidden_dim=actor_kwargs["hidden_dim"],
-            num_layers=actor_kwargs["num_layers"],
-            residual=actor_kwargs["residual"],
-            activation=actor_kwargs["activation"],
-            layer_norm=actor_kwargs["layer_norm"],
-            fixed_std=actor_kwargs["fixed_std"],
-            ref_dropout_p=actor_kwargs["ref_dropout_p"],
-        ),
-        critic=CriticConfig(),
-    )
-    policy = RLTPolicy(rlt_config, vla)
-    policy.to(args.device)
 
-    # Load RL token encoder
-    ckpt = torch.load(args.rl_token_ckpt, map_location="cpu", weights_only=True)
-    filtered, skipped = filter_encoder_only(ckpt["rl_token_state_dict"])
-    policy.rl_token.load_state_dict(filtered, strict=False)
-    log.info("RL token loaded (step %d, skipped %d decoder keys)", ckpt.get("step", -1), len(skipped))
-    del ckpt
-
-    # Load actor (+ overwrite rl_token if present in AC checkpoint)
-    policy.actor.load_state_dict(ac_ckpt["actor_state_dict"])
-    if "rl_token_state_dict" in ac_ckpt:
-        filtered, skipped = filter_encoder_only(ac_ckpt["rl_token_state_dict"])
-        policy.rl_token.load_state_dict(filtered, strict=False)
-        log.info("RL token overwritten from AC checkpoint (skipped %d decoder keys)", len(skipped))
-    log.info("Actor loaded")
-    del ac_ckpt
+    if ac_ckpt is not None:
+        policy.actor.load_state_dict(ac_ckpt["actor_state_dict"])
+        if "rl_token_state_dict" in ac_ckpt:
+            filtered, _ = filter_encoder_only(ac_ckpt["rl_token_state_dict"])
+            policy.rl_token.load_state_dict(filtered, strict=False)
 
     policy.freeze_vla()
     policy.freeze_rl_token_encoder()
     policy.eval()
-    return policy
+    return policy, config
 
 
-def run_rlt_inference(
-    rlt_policy, dataset, camera_full_keys: list[str],
-    device: str, stride: int,
-) -> np.ndarray:
-    """Returns (N, action_dim) — raw actor output."""
+def build_observation(item: dict, device: str):
     from lerobot.rlt.interfaces import Observation
 
-    actions = []
-    frame_indices = list(range(0, len(dataset), stride))
-    log.info("RLT: %d frames (stride=%d)", len(frame_indices), stride)
+    images = {
+        key: item[key].unsqueeze(0).to(device)
+        for key in item
+        if key not in ("proprio", "expert_actions")
+    }
+    proprio = item["proprio"].unsqueeze(0).to(device)
+    return Observation(images=images, proprio=proprio)
 
-    t0 = time.monotonic()
-    for idx in tqdm(frame_indices, desc="RLT"):
-        item = dataset[idx]
-        images = {}
-        for full_key in camera_full_keys:
-            short = full_key.split(".")[-1]
-            images[short] = item[full_key].unsqueeze(0).to(device)
-        proprio = item["observation.state"].unsqueeze(0).to(device)
-        obs = Observation(images=images, proprio=proprio)
+
+def run_episode_inference(
+    policy,
+    dataset,
+    frame_indices: list[int],
+    chunk_length: int,
+    stride: int,
+    device: str,
+    include_rl: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    gt_step0 = []
+    vla_step0 = []
+    rl_step0 = []
+    chunk_ref_mse = []
+    step0_ref_mse = []
+
+    sampled_indices = frame_indices[::stride]
+    log.info("Episode frames=%d, sampled=%d, stride=%d", len(frame_indices), len(sampled_indices), stride)
+    start_time = time.monotonic()
+    for frame_idx in tqdm(sampled_indices, desc="episode"):
+        item = dataset[frame_idx]
+        obs = build_observation(item, device)
+        expert_chunk = item["expert_actions"][:chunk_length, :12]
+        gt_step0.append(expert_chunk[0].cpu().numpy())
+
         with torch.inference_mode():
-            action_chunk, _, _, _ = rlt_policy.select_action(obs, deterministic=True)
-        actions.append(action_chunk[0, 0, :].cpu().numpy())
+            if include_rl:
+                _, actor_chunk, _, ref_chunk = policy.select_action(obs, deterministic=True)
+            else:
+                ref_chunk = policy.get_reference_chunk(obs)
+                actor_chunk = None
 
-    elapsed = time.monotonic() - t0
-    log.info("RLT done: %.1fs (%.0f ms/frame)", elapsed, elapsed / max(len(actions), 1) * 1000)
-    return np.array(actions)
+        ref_chunk_cpu = ref_chunk[0].cpu()
+        vla_step0.append(ref_chunk_cpu[0].numpy())
+
+        if actor_chunk is not None:
+            actor_chunk_cpu = actor_chunk[0].cpu()
+            rl_step0.append(actor_chunk_cpu[0].numpy())
+            chunk_ref_mse.append(((actor_chunk_cpu - ref_chunk_cpu) ** 2).mean().item())
+            step0_ref_mse.append(((actor_chunk_cpu[0] - ref_chunk_cpu[0]) ** 2).mean().item())
+
+    elapsed = time.monotonic() - start_time
+    log.info("Inference done in %.1fs (%.0f ms/frame)", elapsed, elapsed / max(len(sampled_indices), 1) * 1000)
+
+    gt_arr = np.array(gt_step0)
+    vla_arr = np.array(vla_step0)
+    rl_arr = np.array(rl_step0) if rl_step0 else None
+    chunk_mse_arr = np.array(chunk_ref_mse) if chunk_ref_mse else None
+    step0_mse_arr = np.array(step0_ref_mse) if step0_ref_mse else None
+    return gt_arr, vla_arr, rl_arr, chunk_mse_arr, step0_mse_arr
 
 
-# ---------------------------------------------------------------------------
-# Ground truth
-# ---------------------------------------------------------------------------
-
-
-def extract_ground_truth(dataset, stride: int) -> np.ndarray:
-    return np.array([dataset[i]["action"].numpy() for i in range(0, len(dataset), stride)])
-
-
-# ---------------------------------------------------------------------------
-# Statistics
-# ---------------------------------------------------------------------------
-
-COLORS = {"GT": "#1f77b4", "pi0.5": "#ff7f0e", "RLT": "#2ca02c"}
-
-
-def build_stats_html(gt: np.ndarray, pi05: np.ndarray, rlt: np.ndarray | None) -> str:
-    dim = gt.shape[1]
-    names = DEFAULT_JOINT_NAMES[:dim]
-    has_rlt = rlt is not None
-    f = lambda v: f"{v:.2f}"  # noqa: E731
-    td = '<td style="padding:2px 6px;border:1px solid #ddd;text-align:right;">'
-
-    hdr = "<tr><th>Joint</th><th>GT μ</th><th>GT σ</th><th>pi0.5 μ</th><th>pi0.5 σ</th><th>MAE(pi0.5)</th>"
-    if has_rlt:
-        hdr += "<th>RLT μ</th><th>RLT σ</th><th>MAE(RLT)</th>"
-    hdr += "</tr>"
-
+def build_stats_html(
+    *,
+    gt: np.ndarray,
+    vla: np.ndarray,
+    rl: np.ndarray | None,
+    chunk_ref_mse: np.ndarray | None,
+    step0_ref_mse: np.ndarray | None,
+    episode_index: int,
+    total_frames: int,
+    sampled_frames: int,
+    action_space: str,
+    vla_model: str,
+    ac_ckpt: str | None,
+) -> str:
     rows = []
-    for j, name in enumerate(names):
-        g, p = gt[:, j], pi05[:, j]
-        row = (
-            f'{td}{name}</td>'
-            f'{td}{f(g.mean())}</td>{td}{f(g.std())}</td>'
-            f'{td}{f(p.mean())}</td>{td}{f(p.std())}</td>'
-            f'{td}<b>{f(np.mean(np.abs(p - g)))}</b></td>'
+    for joint_index, joint_name in enumerate(JOINT_TYPES):
+        left_index = joint_index
+        right_index = joint_index + 6
+        row = [f"<td>{joint_name}</td>"]
+        for label, array in [("GT-L", gt), ("GT-R", gt), ("VLA-L", vla), ("VLA-R", vla), ("RL-L", rl), ("RL-R", rl)]:
+            if array is None:
+                row.append("<td>-</td><td>-</td><td>-</td>")
+                continue
+            dim_index = left_index if label.endswith("-L") else right_index
+            mae = np.abs(array[:, dim_index] - gt[:, dim_index]).mean()
+            row.append(f"<td>{array[:, dim_index].mean():.3f}</td>")
+            row.append(f"<td>{array[:, dim_index].std():.3f}</td>")
+            row.append(f"<td>{mae:.3f}</td>")
+        rows.append("<tr>" + "".join(row) + "</tr>")
+
+    header_cells = [
+        "<th>Joint</th>",
+        "<th>GT-L μ</th><th>GT-L σ</th><th>GT-L MAE</th>",
+        "<th>GT-R μ</th><th>GT-R σ</th><th>GT-R MAE</th>",
+        "<th>VLA-L μ</th><th>VLA-L σ</th><th>VLA-L MAE</th>",
+        "<th>VLA-R μ</th><th>VLA-R σ</th><th>VLA-R MAE</th>",
+        "<th>RL-L μ</th><th>RL-L σ</th><th>RL-L MAE</th>",
+        "<th>RL-R μ</th><th>RL-R σ</th><th>RL-R MAE</th>",
+    ]
+    summary_lines = [
+        f"<p><b>episode</b>: {episode_index} &nbsp; <b>frames</b>: {total_frames} &nbsp; <b>sampled</b>: {sampled_frames}</p>",
+        f"<p><b>action_space</b>: {action_space} &nbsp; <b>vla_model</b>: {vla_model}</p>",
+    ]
+    if ac_ckpt is not None and chunk_ref_mse is not None and step0_ref_mse is not None:
+        summary_lines.append(
+            "<p><b>mean chunk ref_mse</b>: "
+            f"{chunk_ref_mse.mean():.6f} &nbsp; <b>mean step0 ref_mse</b>: {step0_ref_mse.mean():.6f}</p>"
         )
-        if has_rlt:
-            r = rlt[:, j]
-            row += (
-                f'{td}{f(r.mean())}</td>{td}{f(r.std())}</td>'
-                f'{td}<b>{f(np.mean(np.abs(r - g)))}</b></td>'
-            )
-        rows.append(f"<tr>{row}</tr>")
+        summary_lines.append(f"<p><b>ac_ckpt</b>: {ac_ckpt}</p>")
 
     return (
-        '<h3 style="font-family:sans-serif;">Per-Joint Statistics (degrees)</h3>'
-        '<table style="border-collapse:collapse;font-family:monospace;font-size:13px;">'
-        f'<thead style="background:#f0f0f0;">{hdr}</thead>'
-        f'<tbody>{"".join(rows)}</tbody></table>'
+        '<div style="font-family:sans-serif;">'
+        + "".join(summary_lines)
+        + '<table style="border-collapse:collapse;font-family:monospace;font-size:12px;">'
+        + f'<thead style="background:#f0f0f0;"><tr>{"".join(header_cells)}</tr></thead>'
+        + f'<tbody>{"".join(rows)}</tbody></table>'
+        + "</div>"
     )
 
 
-# ---------------------------------------------------------------------------
-# HTML generation: 30-frame sliding window with scrub bar
-# ---------------------------------------------------------------------------
-
-
 def build_html(
-    gt: np.ndarray, pi05: np.ndarray, rlt: np.ndarray | None,
-    stride: int, fps: float, stats_html: str,
+    *,
+    gt: np.ndarray,
+    vla: np.ndarray,
+    rl: np.ndarray | None,
+    fps: float,
+    stride: int,
+    window_size: int,
+    stats_html: str,
+    title: str,
 ) -> str:
-    """Generate self-contained HTML with plotly + vanilla JS slider for 30-frame window."""
-    n = gt.shape[0]
-    time_s = (np.arange(n) * stride / fps).tolist()
-
-    # Prepare data as JSON for the JS side
-    sources = {"GT": gt.tolist(), "pi05": pi05.tolist()}
-    if rlt is not None:
-        sources["RLT"] = rlt.tolist()
-
-    data_json = json.dumps({
-        "time": time_s,
-        "sources": sources,
-        "n": n,
-        "stride": stride,
-        "fps": fps,
+    num_frames = gt.shape[0]
+    time_axis = (np.arange(num_frames) * stride / fps).tolist()
+    data = {
+        "time": time_axis,
+        "window": window_size,
+        "num_frames": num_frames,
+        "gt": gt.tolist(),
+        "vla": vla.tolist(),
+        "rl": rl.tolist() if rl is not None else None,
         "joint_types": JOINT_TYPES,
-        "window": WINDOW,
         "colors": COLORS,
-    })
+    }
+    data_json = json.dumps(data)
 
     return f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8">
-<title>VLA Action Visualization</title>
+<html>
+<head>
+<meta charset="utf-8">
+<title>{title}</title>
 <script src="https://cdn.plot.ly/plotly-3.5.0.min.js"></script>
 <style>
-  body {{ font-family: sans-serif; margin: 20px; }}
-  #slider-container {{ padding: 10px 40px; }}
-  #frame-slider {{ width: 100%; cursor: pointer; }}
-  #frame-info {{ text-align: center; margin: 5px 0; font-size: 14px; }}
-  .stats-container {{ padding: 20px; }}
+body {{ font-family: sans-serif; margin: 20px; }}
+#plot {{ width: 100%; height: 920px; }}
+#slider-container {{ margin: 16px 24px; }}
+#frame-slider {{ width: 100%; }}
+#frame-info {{ text-align: center; margin-bottom: 8px; }}
 </style>
-</head><body>
+</head>
+<body>
+<h2>{title}</h2>
 <div id="plot"></div>
 <div id="slider-container">
-  <div id="frame-info">Frame 0 - {WINDOW-1} / {n-1} &nbsp; (0.00s - {(WINDOW-1)*stride/fps:.2f}s)</div>
-  <input type="range" id="frame-slider" min="0" max="{max(0, n - WINDOW)}" value="0" step="1">
+  <div id="frame-info"></div>
+  <input type="range" id="frame-slider" min="0" max="{max(0, num_frames - window_size)}" value="0" step="1">
 </div>
-<div class="stats-container">{stats_html}</div>
-
+{stats_html}
 <script>
 const D = {data_json};
-const W = D.window;
-const JT = D.joint_types;
-const SRC_KEYS = Object.keys(D.sources);
-const DASH = {{GT: "solid", pi05: "solid", RLT: "solid"}};
-const CLR = {{GT: D.colors.GT, pi05: D.colors["pi0.5"], RLT: D.colors.RLT}};
-const LABEL = {{GT: "GT", pi05: "pi0.5", RLT: "RLT"}};
+const plotDiv = document.getElementById("plot");
+const slider = document.getElementById("frame-slider");
+const info = document.getElementById("frame-info");
+
+function trace(name, x, y, color, dash, axisIndex, showlegend) {{
+  const suffix = axisIndex === 1 ? "" : String(axisIndex);
+  return {{
+    x: x,
+    y: y,
+    type: "scatter",
+    mode: "lines",
+    name: name,
+    line: {{color: color, dash: dash, width: 1.6}},
+    xaxis: "x" + suffix,
+    yaxis: "y" + suffix,
+    showlegend: showlegend,
+  }};
+}}
 
 function buildTraces(start) {{
-  const end = Math.min(start + W, D.n);
-  const t = D.time.slice(start, end);
+  const end = Math.min(start + D.window, D.num_frames);
+  const x = D.time.slice(start, end);
   const traces = [];
-  for (let ji = 0; ji < 6; ji++) {{
-    const li = ji, ri = ji + 6;
-    const row = Math.floor(ji / 2) + 1;
-    const col = (ji % 2) + 1;
-    for (const sk of SRC_KEYS) {{
-      const arr = D.sources[sk];
-      const yL = arr.slice(start, end).map(r => r[li]);
-      const yR = arr.slice(start, end).map(r => r[ri]);
-      traces.push({{
-        x: t, y: yL, type: "scatter", mode: "lines",
-        name: LABEL[sk] + " L", legendgroup: LABEL[sk] + "_L",
-        line: {{color: CLR[sk], dash: "solid", width: 1.5}},
-        showlegend: ji === 0,
-        xaxis: "x" + (ji > 0 ? (ji+1) : ""),
-        yaxis: "y" + (ji > 0 ? (ji+1) : ""),
-        hovertemplate: LABEL[sk] + " L_" + JT[ji] + ": %{{y:.2f}}<extra></extra>",
-      }});
-      traces.push({{
-        x: t, y: yR, type: "scatter", mode: "lines",
-        name: LABEL[sk] + " R", legendgroup: LABEL[sk] + "_R",
-        line: {{color: CLR[sk], dash: "dash", width: 1.5}},
-        showlegend: ji === 0,
-        xaxis: "x" + (ji > 0 ? (ji+1) : ""),
-        yaxis: "y" + (ji > 0 ? (ji+1) : ""),
-        hovertemplate: LABEL[sk] + " R_" + JT[ji] + ": %{{y:.2f}}<extra></extra>",
-      }});
+  for (let joint = 0; joint < 6; joint++) {{
+    const axisIndex = joint + 1;
+    const left = joint;
+    const right = joint + 6;
+    const gt = D.gt.slice(start, end);
+    const vla = D.vla.slice(start, end);
+    traces.push(trace("gt-left", x, gt.map(row => row[left]), D.colors.gt_left, "solid", axisIndex, joint === 0));
+    traces.push(trace("gt-right", x, gt.map(row => row[right]), D.colors.gt_right, "solid", axisIndex, joint === 0));
+    traces.push(trace("vla-left", x, vla.map(row => row[left]), D.colors.vla_left, "solid", axisIndex, joint === 0));
+    traces.push(trace("vla-right", x, vla.map(row => row[right]), D.colors.vla_right, "solid", axisIndex, joint === 0));
+    if (D.rl !== null) {{
+      const rl = D.rl.slice(start, end);
+      traces.push(trace("rl-left", x, rl.map(row => row[left]), D.colors.rl_left, "solid", axisIndex, joint === 0));
+      traces.push(trace("rl-right", x, rl.map(row => row[right]), D.colors.rl_right, "solid", axisIndex, joint === 0));
     }}
   }}
   return traces;
 }}
 
-function makeLayout() {{
+function buildLayout() {{
   const layout = {{
-    height: 900, width: 1200,
+    height: 920,
     template: "plotly_white",
     grid: {{rows: 3, columns: 2, pattern: "independent", roworder: "top to bottom"}},
-    legend: {{orientation: "h", y: -0.05, x: 0.5, xanchor: "center"}},
-    margin: {{t: 40, b: 60}},
+    margin: {{l: 60, r: 20, t: 30, b: 60}},
+    legend: {{orientation: "h", y: -0.08, x: 0.5, xanchor: "center"}},
+    annotations: [],
   }};
-  for (let ji = 0; ji < 6; ji++) {{
-    const ax = ji > 0 ? (ji+1) : "";
-    layout["xaxis" + ax] = {{title: "time (s)"}};
-    layout["yaxis" + ax] = {{title: JT[ji].replace(/_/g, " ")}};
-  }}
-  // subplot titles via annotations
-  for (let ji = 0; ji < 6; ji++) {{
-    if (!layout.annotations) layout.annotations = [];
-    const col = ji % 2, row = Math.floor(ji / 2);
+  for (let joint = 0; joint < 6; joint++) {{
+    const axisIndex = joint + 1;
+    const suffix = axisIndex === 1 ? "" : String(axisIndex);
+    layout["xaxis" + suffix] = {{title: "time (s)"}};
+    layout["yaxis" + suffix] = {{title: D.joint_types[joint]}};
+    const col = joint % 2;
+    const row = Math.floor(joint / 2);
     layout.annotations.push({{
-      text: JT[ji].replace(/_/g, " ").replace(/\\b\\w/g, c => c.toUpperCase()),
-      xref: "paper", yref: "paper",
-      x: col * 0.55 + 0.22, y: 1.0 - row * 0.34,
-      showarrow: false, font: {{size: 13}},
+      text: D.joint_types[joint],
+      xref: "paper",
+      yref: "paper",
+      x: col * 0.5 + 0.22,
+      y: 1.0 - row * 0.34,
+      showarrow: false,
+      font: {{size: 13}},
     }});
   }}
   return layout;
 }}
 
-const plotDiv = document.getElementById("plot");
-Plotly.newPlot(plotDiv, buildTraces(0), makeLayout(), {{responsive: true}});
+function updateFrameInfo(start) {{
+  const end = Math.min(start + D.window, D.num_frames) - 1;
+  const t0 = D.time[start].toFixed(2);
+  const t1 = D.time[end].toFixed(2);
+  info.textContent =
+    "frame " + start + " - " + end + " / " + (D.num_frames - 1) +
+    " (" + t0 + "s - " + t1 + "s)";
+}}
 
-const slider = document.getElementById("frame-slider");
-const info = document.getElementById("frame-info");
-slider.addEventListener("input", function() {{
-  const start = parseInt(this.value);
-  const end = Math.min(start + W, D.n) - 1;
-  const tStart = D.time[start].toFixed(2);
-  const tEnd = D.time[end].toFixed(2);
-  info.textContent = "Frame " + start + " - " + end + " / " + (D.n-1) + "  (" + tStart + "s - " + tEnd + "s)";
-  Plotly.react(plotDiv, buildTraces(start), makeLayout());
-}});
+function render(start) {{
+  updateFrameInfo(start);
+  Plotly.react(plotDiv, buildTraces(start), buildLayout(), {{responsive: true}});
+}}
+
+slider.addEventListener("input", () => render(parseInt(slider.value, 10)));
+render(0);
 </script>
-</body></html>"""
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+</body>
+</html>"""
 
 
 def main() -> None:
     args = parse_args()
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper()),
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        format="%(asctime)s %(levelname)s %(message)s",
     )
-    has_rlt = bool(args.rl_token_ckpt and args.ac_ckpt)
 
-    # 1. Dataset
-    dataset = load_dataset(args.dataset_path, args.repo_id, args.episode_index)
-    camera_keys = detect_camera_keys(dataset)
-    camera_full_keys = [f"observation.images.{k}" for k in camera_keys]
-    fps = dataset.meta.fps
-    log.info("Cameras: %s, fps=%d, frames=%d", camera_keys, fps, len(dataset))
+    rl_paths = None if args.no_rl else resolve_rl_model_paths(args)
+    config_path = rl_paths.config_path if rl_paths is not None else args.config or None
+    policy, config = build_policy(args, config_path, rl_paths)
 
-    # Load unnormalization stats
+    dataset = load_demo_dataset(args.dataset_path, args.repo_id, config.vla_horizon)
+    episode_index, frame_indices = select_episode(dataset, args.episode_index)
     q01, q99 = load_action_quantiles(dataset)
-    log.info("Action q01[:4]=%s  q99[:4]=%s", q01[:4].tolist(), q99[:4].tolist())
+    fps = dataset._dataset.meta.fps
 
-    # 2. Ground truth (already in original space)
-    gt_actions = extract_ground_truth(dataset, args.stride)
-    log.info("GT shape: %s, range=[%.1f, %.1f]", gt_actions.shape, gt_actions.min(), gt_actions.max())
-
-    # 3. Pi0.5 inference (normalized) -> unnormalize
-    log.info("Loading pi0.5 from %s ...", args.vla_model)
-    pi05_policy, preprocessor = load_pi05_policy(args.vla_model, dataset, args.device)
-    pi05_norm = run_pi05_inference(
-        pi05_policy, preprocessor, dataset, camera_full_keys,
-        args.task, args.device, args.stride,
+    log.info("Using episode %d", episode_index)
+    gt, vla, rl, chunk_ref_mse, step0_ref_mse = run_episode_inference(
+        policy=policy,
+        dataset=dataset,
+        frame_indices=frame_indices,
+        chunk_length=config.chunk_length,
+        stride=args.stride,
+        device=args.device,
+        include_rl=rl_paths is not None,
     )
-    pi05_actions = unnormalize_actions(pi05_norm, q01, q99)
-    log.info("pi0.5 unnormalized range: [%.1f, %.1f]", pi05_actions.min(), pi05_actions.max())
-    del pi05_policy, preprocessor
-    torch.cuda.empty_cache()
-    import gc; gc.collect()  # free CPU RAM before loading RLT
 
-    # 4. RLT inference (normalized training space) -> unnormalize for comparison
-    rlt_actions = None
-    if has_rlt:
-        log.info("Loading RLT rl_token=%s ac=%s ...", args.rl_token_ckpt, args.ac_ckpt)
-        rlt_policy = load_rlt_policy(args)
-        rlt_norm = run_rlt_inference(
-            rlt_policy, dataset, camera_full_keys, args.device, args.stride,
-        )
-        rlt_actions = unnormalize_actions(rlt_norm, q01, q99)
-        log.info("RLT unnormalized range: [%.1f, %.1f]", rlt_actions.min(), rlt_actions.max())
-        del rlt_policy
-        torch.cuda.empty_cache()
+    gt_plot = convert_action_space(gt, args.action_space, q01, q99)
+    vla_plot = convert_action_space(vla, args.action_space, q01, q99)
+    rl_plot = None if rl is None else convert_action_space(rl, args.action_space, q01, q99)
 
-    # 5. Truncate to common action_dim
-    dim = min(gt_actions.shape[1], pi05_actions.shape[1])
-    if rlt_actions is not None:
-        dim = min(dim, rlt_actions.shape[1])
-    gt_actions, pi05_actions = gt_actions[:, :dim], pi05_actions[:, :dim]
-    if rlt_actions is not None:
-        rlt_actions = rlt_actions[:, :dim]
-
-    # 6. Generate HTML
-    stats = build_stats_html(gt_actions, pi05_actions, rlt_actions)
-    html = build_html(gt_actions, pi05_actions, rlt_actions, args.stride, fps, stats)
+    stats_html = build_stats_html(
+        gt=gt_plot,
+        vla=vla_plot,
+        rl=rl_plot,
+        chunk_ref_mse=chunk_ref_mse,
+        step0_ref_mse=step0_ref_mse,
+        episode_index=episode_index,
+        total_frames=len(frame_indices),
+        sampled_frames=len(gt_plot),
+        action_space=args.action_space,
+        vla_model=args.vla_model,
+        ac_ckpt=None if rl_paths is None else rl_paths.ac_ckpt,
+    )
+    html = build_html(
+        gt=gt_plot,
+        vla=vla_plot,
+        rl=rl_plot,
+        fps=fps,
+        stride=args.stride,
+        window_size=args.window_size,
+        stats_html=stats_html,
+        title=f"Episode {episode_index}: GT vs VLA vs RL ({args.action_space})",
+    )
     Path(args.output).write_text(html, encoding="utf-8")
-    log.info("Written to %s", args.output)
+    log.info("Wrote %s", args.output)
 
 
 if __name__ == "__main__":

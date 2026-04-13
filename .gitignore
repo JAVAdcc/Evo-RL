@@ -193,3 +193,6 @@ replay/
 # Local notes and scratch docs
 docs/**/*.md
 scripts/dataset/rollout_data_clean.md
+
+# Local scratch (run_*.sh, etc.)
+scratch/
