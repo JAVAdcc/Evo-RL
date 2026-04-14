@@ -1479,13 +1479,24 @@ class LeRobotDataset(torch.utils.data.Dataset):
             # Initialize indices for a new dataset made of the first episode data
             chunk_idx, file_idx = 0, 0
             if self.meta.episodes is not None and len(self.meta.episodes) > 0:
-                # It means we are resuming recording, so we need to load the latest episode
-                # Update the indices to avoid overwriting the latest episode
-                old_chunk_idx = self.meta.episodes[-1][f"videos/{video_key}/chunk_index"]
-                old_file_idx = self.meta.episodes[-1][f"videos/{video_key}/file_index"]
-                chunk_idx, file_idx = update_chunk_file_indices(
-                    old_chunk_idx, old_file_idx, self.meta.chunks_size
-                )
+                # Look up the most recent episode that already carries video
+                # metadata for this key. The naive `meta.episodes[-1]` lookup
+                # breaks when we are batch-encoding a fresh dataset: every
+                # episode was saved with deferred video encoding, so the cache
+                # contains data/ keys but no videos/ keys until each episode
+                # is actually encoded inside this loop.
+                prev_video_ep = None
+                for ep in reversed(self.meta.episodes):
+                    if f"videos/{video_key}/chunk_index" in ep:
+                        prev_video_ep = ep
+                        break
+                if prev_video_ep is not None:
+                    # Resuming or mid-batch — advance off the previous file.
+                    old_chunk_idx = prev_video_ep[f"videos/{video_key}/chunk_index"]
+                    old_file_idx = prev_video_ep[f"videos/{video_key}/file_index"]
+                    chunk_idx, file_idx = update_chunk_file_indices(
+                        old_chunk_idx, old_file_idx, self.meta.chunks_size
+                    )
             latest_duration_in_s = 0.0
             new_path = self.root / self.meta.video_path.format(
                 video_key=video_key, chunk_index=chunk_idx, file_index=file_idx
