@@ -1485,15 +1485,23 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 # episode was saved with deferred video encoding, so the cache
                 # contains data/ keys but no videos/ keys until each episode
                 # is actually encoded inside this loop.
-                prev_video_ep = None
+                # In batched mode the parquet schema reserves the videos/
+                # columns up front so every loaded episode has those keys,
+                # but the values stay None until that episode is actually
+                # encoded. A plain "in" check therefore matches every
+                # episode in the cache; we have to also verify the values
+                # are populated before we can advance off them.
+                old_chunk_idx = None
+                old_file_idx = None
                 for ep in reversed(self.meta.episodes):
-                    if f"videos/{video_key}/chunk_index" in ep:
-                        prev_video_ep = ep
+                    cand_chunk = ep.get(f"videos/{video_key}/chunk_index")
+                    cand_file = ep.get(f"videos/{video_key}/file_index")
+                    if cand_chunk is not None and cand_file is not None:
+                        old_chunk_idx = cand_chunk
+                        old_file_idx = cand_file
                         break
-                if prev_video_ep is not None:
+                if old_chunk_idx is not None:
                     # Resuming or mid-batch — advance off the previous file.
-                    old_chunk_idx = prev_video_ep[f"videos/{video_key}/chunk_index"]
-                    old_file_idx = prev_video_ep[f"videos/{video_key}/file_index"]
                     chunk_idx, file_idx = update_chunk_file_indices(
                         old_chunk_idx, old_file_idx, self.meta.chunks_size
                     )
