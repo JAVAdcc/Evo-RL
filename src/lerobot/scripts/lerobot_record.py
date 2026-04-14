@@ -721,9 +721,18 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     on_episode_outcome(robot, teleop, episode_success)
 
                 # Execute a few seconds without recording to give time to manually reset the environment
-                # Skip reset for the last episode to be recorded
-                if not events["stop_recording"] and (
-                    (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
+                # Skip reset for the last episode to be recorded.
+                # Also skip entirely in start_in_teleop mode: the next episode
+                # already begins in human-teleop with skip_prefix_recording, so
+                # the user can take as long as they want before pressing r —
+                # there is no functional difference vs the reset loop.
+                if (
+                    not events["stop_recording"]
+                    and not cfg.rlt.start_in_teleop
+                    and (
+                        (recorded_episodes < cfg.dataset.num_episodes - 1)
+                        or events["rerecord_episode"]
+                    )
                 ):
                     log_say("Reset the environment", cfg.play_sounds)
 
