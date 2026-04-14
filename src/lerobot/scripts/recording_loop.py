@@ -393,7 +393,16 @@ def record_loop(
                             uncond_policy_runtime_state = _capture_policy_runtime_state(policy)
                         logging.info("Policy cache reset on release: next policy action is recomputed.")
                     if rlt is not None:
-                        rlt.interrupt_chunk()
+                        # policy.reset() above also reset rlt.phase_ctrl back
+                        # to VLA_PHASE. If the user was inside an RL phase
+                        # when they pressed SPACE, restore RL mode here so
+                        # the next forward keeps producing RL actor actions
+                        # (and skip_prefix_recording does not drop the
+                        # post-release frames as PHASE_PREFIX).
+                        if rl_phase_started:
+                            rlt.set_rl_mode()
+                        else:
+                            rlt.interrupt_chunk()
                         log_say("resume", play_sounds=True)
                         logging.info("RLT chunk interrupted on release: next action recomputed.")
                     logging.info("Intervention release requested (S2): returning control to policy.")
