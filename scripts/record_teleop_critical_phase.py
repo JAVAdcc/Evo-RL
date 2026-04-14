@@ -231,6 +231,18 @@ def main():
 
     leader_cal_dir.cleanup()
 
+    # Post-record: stamp every frame as is_intervention=1 for teleop-only data.
+    # The recording loop writes is_intervention=0 because the intervention state
+    # machine is disabled in this mode; semantically every frame here is human
+    # action, so we rewrite the column in place before exit.
+    from scripts.dataset.fix_teleop_is_intervention import rewrite_dataset
+    if dataset_root.exists() and (dataset_root / "meta" / "info.json").exists():
+        stats = rewrite_dataset(dataset_root)
+        log.info(
+            "Post-record is_intervention rewrite: %d/%d parquet rows, %d jsonl lines",
+            stats["parquet_changed"], stats["parquet_rows"], stats["jsonl_changed"],
+        )
+
     log.info("=== record_teleop_critical_phase finished ===")
 
 

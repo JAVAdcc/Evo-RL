@@ -269,7 +269,21 @@ def extract_critical_phase_dataset_direct(
                     if k not in hf_item:
                         continue
                     v = hf_item[k]
-                    frame[k] = v.numpy() if isinstance(v, torch.Tensor) else v
+                    if isinstance(v, torch.Tensor):
+                        v = v.numpy()
+                    # Coerce scalar -> (1,) when the target feature declares shape [1].
+                    # Needed for complementary_info.{is_intervention,state,phase,collector_policy_id}
+                    # which the recording loop writes as length-1 arrays but parquet stores as scalars.
+                    feat = output_ds.features.get(k, {}) if hasattr(output_ds, "features") else {}
+                    feat_shape = feat.get("shape") if isinstance(feat, dict) else None
+                    if (
+                        feat_shape is not None
+                        and list(feat_shape) == [1]
+                        and np.ndim(v) == 0
+                    ):
+                        feat_dtype = feat.get("dtype", "float32") if isinstance(feat, dict) else "float32"
+                        v = np.array([v], dtype=np.dtype(feat_dtype))
+                    frame[k] = v
                 output_ds.add_frame(frame)
 
             # save_episode: encode uses direct_encode_wrapper, stats use in-memory data
