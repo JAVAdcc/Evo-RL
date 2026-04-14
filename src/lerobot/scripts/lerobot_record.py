@@ -267,6 +267,14 @@ class RecordConfig:
     intervention_state_machine_enabled: bool = True
     # Keyboard key used to toggle entering/leaving intervention.
     intervention_toggle_key: str = "i"
+    # Pure-teleop mode: r key starts an episode (entering critical phase),
+    # second r press ends the episode and marks it success; a double-tap
+    # inside `rlt.rl_phase_double_tap_window_s` marks it failure. No VLA,
+    # no RL inference, no SPACE intervention — teleop drives the entire
+    # time, r is the only episode-control input. Requires policy to be
+    # None (teleop-only) and reuses the same underlying state machine as
+    # the rlt wo_prefix recorder.
+    teleop_r_key_episodes: bool = False
     # Whether to capture episode-level success/failure labels from keyboard.
     enable_episode_outcome_labeling: bool = False
     # Keyboard key to mark the current episode as success and end it.
@@ -590,7 +598,12 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             )
 
         critical_phase_tracker = None
-        if cfg.enable_critical_phase_labeling or (cfg.rlt.enable and cfg.rlt.vla_model):
+        teleop_r_key_mode = cfg.teleop_r_key_episodes and policy is None
+        if (
+            cfg.enable_critical_phase_labeling
+            or (cfg.rlt.enable and cfg.rlt.vla_model)
+            or teleop_r_key_mode
+        ):
             from lerobot.utils.critical_phase_tracker import CriticalPhaseTracker, EpisodeIntervalTracker
 
             critical_phase_tracker = CriticalPhaseTracker(
@@ -608,14 +621,24 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         # RLT HIL mode: use SPACE for intervention, r/s/f for phase control
         rlt_hil_mode = cfg.rlt.enable and policy is not None and teleop is not None
         rlt_active = cfg.rlt.enable and policy is not None
+        if rlt_active:
+            rl_phase_key_binding = cfg.rlt.rl_phase_key
+        elif teleop_r_key_mode:
+            rl_phase_key_binding = "r"
+        else:
+            rl_phase_key_binding = None
+        # In teleop_r_key_mode the r key is the single episode-control input;
+        # unbind s/f so the user cannot accidentally end an episode out of
+        # the double-tap state machine.
+        bind_ep_outcome_keys = cfg.enable_episode_outcome_labeling and not teleop_r_key_mode
         listener, events = init_keyboard_listener(
             intervention_toggle_key=" " if rlt_hil_mode else cfg.intervention_toggle_key,
             critical_phase_toggle_key=cp_key if not rlt_active else None,
-            episode_success_key=cfg.episode_success_key if cfg.enable_episode_outcome_labeling else None,
-            episode_failure_key=cfg.episode_failure_key if cfg.enable_episode_outcome_labeling else None,
+            episode_success_key=cfg.episode_success_key if bind_ep_outcome_keys else None,
+            episode_failure_key=cfg.episode_failure_key if bind_ep_outcome_keys else None,
             cp_success_key="s" if cfg.enable_critical_phase_labeling and not rlt_active else None,
             cp_failure_key="f" if cfg.enable_critical_phase_labeling and not rlt_active else None,
-            rl_phase_key=cfg.rlt.rl_phase_key if rlt_active else None,
+            rl_phase_key=rl_phase_key_binding,
             end_success_key=cfg.rlt.end_success_key if rlt_active else None,
             end_failure_key=cfg.rlt.end_failure_key if rlt_active else None,
         )
@@ -688,8 +711,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     communication_retry_interval_s=cfg.communication_retry_interval_s,
                     critical_phase_tracker=critical_phase_tracker,
                     rlt_intervention_tracker=intervention_tracker,
-                    skip_prefix_recording=cfg.rlt.skip_prefix_recording,
-                    rl_phase_key_toggles_episode=cfg.rlt.rl_phase_key_toggles_episode,
+                    skip_prefix_recording=cfg.rlt.skip_prefix_recording or teleop_r_key_mode,
+                    rl_phase_key_toggles_episode=cfg.rlt.rl_phase_key_toggles_episode or teleop_r_key_mode,
                     rl_phase_key_toggles_critical_phase=cfg.rlt.rl_phase_key_toggles_critical_phase,
                     rl_phase_double_tap_window_s=cfg.rlt.rl_phase_double_tap_window_s,
                     start_in_teleop=cfg.rlt.start_in_teleop,
@@ -729,6 +752,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 if (
                     not events["stop_recording"]
                     and not cfg.rlt.start_in_teleop
+                    and not teleop_r_key_mode
                     and (
                         (recorded_episodes < cfg.dataset.num_episodes - 1)
                         or events["rerecord_episode"]

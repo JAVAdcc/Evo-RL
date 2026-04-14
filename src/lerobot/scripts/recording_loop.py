@@ -439,13 +439,18 @@ def record_loop(
             # an already-running RL phase. Pre-start teleop (start_in_teleop
             # mode, rl_phase_started=False) must still allow r to fire so the
             # user can transition from pre-episode teleop into RL.
+            r_key_active = (
+                rlt is not None
+                or rl_phase_key_toggles_episode
+                or rl_phase_key_toggles_critical_phase
+            )
             if (
                 rl_phase_started
                 and intervention_enabled
                 and intervention_state == INTERVENTION_STATE_ACTIVE
             ):
                 logging.info("Ignoring r key: human intervention is active")
-            elif rlt is not None:
+            elif r_key_active:
                 toggles_episode = rl_phase_key_toggles_episode
                 toggles_cp = rl_phase_key_toggles_critical_phase
                 if (toggles_episode or toggles_cp) and rl_phase_started:
@@ -463,7 +468,8 @@ def record_loop(
                             final_outcome = EPISODE_FAILURE
                             events["exit_early"] = True
                         else:  # toggles_cp
-                            rlt.set_vla_mode()
+                            if rlt is not None:
+                                rlt.set_vla_mode()
                             if critical_phase_tracker is not None and dataset is not None:
                                 critical_phase_tracker.mark_failure(dataset.episode_buffer["size"])
                             rl_phase_started = False
@@ -477,7 +483,8 @@ def record_loop(
                     if intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE:
                         intervention_state = INTERVENTION_STATE_RELEASE
                         set_teleop_manual_control(False)
-                    rlt.set_rl_mode()
+                    if rlt is not None:
+                        rlt.set_rl_mode()
                     if critical_phase_tracker is not None and dataset is not None:
                         critical_phase_tracker.toggle(dataset.episode_buffer["size"])
                     rl_phase_started = True
@@ -657,7 +664,14 @@ def record_loop(
         if rlt is not None and not is_intervention:
             rlt_meta = rlt.pop_step_metadata()
 
-        rlt_phase = rlt_meta.phase if rlt_meta is not None else prev_phase
+        if rlt is None and skip_prefix_recording:
+            # Pure-teleop mode with r-key-driven episode boundaries: derive
+            # the phase gate from rl_phase_started so skip_prefix_recording
+            # drops pre-r frames even though no rlt policy is emitting
+            # per-step phase metadata.
+            rlt_phase = PHASE_CRITICAL if rl_phase_started else PHASE_PREFIX
+        else:
+            rlt_phase = rlt_meta.phase if rlt_meta is not None else prev_phase
         rlt_source = SOURCE_HUMAN if is_intervention else (rlt_meta.source_type if rlt_meta else SOURCE_VLA)
         rlt_is_critical = float(rlt_phase == PHASE_CRITICAL)
 
