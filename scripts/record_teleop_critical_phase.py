@@ -80,9 +80,9 @@ def parse_args() -> argparse.Namespace:
 
 def _build_camera_configs(cameras: list[dict]) -> tuple[dict, dict]:
     """Split cameras into left/right dicts for BiSOFollower."""
-    CAM_RENAME = {"left_wrist": "wrist", "right_wrist": "wrist", "top": "front"}
+    CAM_RENAME = {"left_wrist": "wrist", "right_wrist": "wrist", "right_front": "front"}
     LEFT_CAMS = {"left_wrist"}
-    RIGHT_CAMS = {"right_wrist", "top"}
+    RIGHT_CAMS = {"right_wrist", "right_front"}
 
     left_cameras, right_cameras = {}, {}
     for cam in cameras:

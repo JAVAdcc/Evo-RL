@@ -104,9 +104,9 @@ def stage_calibration_files(followers: list[dict], cal_dir: Path) -> None:
 # Camera config
 # ---------------------------------------------------------------------------
 
-CAM_RENAME = {"left_wrist": "wrist", "right_wrist": "wrist", "top": "front"}
+CAM_RENAME = {"left_wrist": "wrist", "right_wrist": "wrist", "right_front": "front"}
 LEFT_ALIASES = {"left_wrist"}
-RIGHT_ALIASES = {"right_wrist", "top"}
+RIGHT_ALIASES = {"right_wrist", "right_front"}
 
 
 def build_camera_configs(cameras: list[dict]) -> tuple[dict, dict]:
