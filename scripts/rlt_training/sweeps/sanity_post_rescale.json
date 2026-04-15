@@ -1,0 +1,12 @@
+[
+  {
+    "name": "sanity_F2_equiv",
+    "probs": {
+      "warmup_vla": 0.2,
+      "human_expert": 0.4,
+      "rl_rollout": 0.4
+    },
+    "beta": 5,
+    "gradient_steps": 30000
+  }
+]

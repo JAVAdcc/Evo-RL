@@ -1,0 +1,94 @@
+[
+  {
+    "name": "F1_rs_0.01",
+    "probs": {
+      "warmup_vla": 0.2,
+      "human_expert": 0.4,
+      "rl_rollout": 0.4
+    },
+    "gradient_steps": 30000
+  },
+  {
+    "name": "F2_rs_0.05",
+    "probs": {
+      "warmup_vla": 0.2,
+      "human_expert": 0.4,
+      "rl_rollout": 0.4
+    },
+    "gradient_steps": 30000
+  },
+  {
+    "name": "F3_rs_0.3",
+    "probs": {
+      "warmup_vla": 0.2,
+      "human_expert": 0.4,
+      "rl_rollout": 0.4
+    },
+    "gradient_steps": 30000
+  },
+  {
+    "name": "F4_rs_0.1_long",
+    "probs": {
+      "warmup_vla": 0.2,
+      "human_expert": 0.4,
+      "rl_rollout": 0.4
+    },
+    "gradient_steps": 80000
+  },
+  {
+    "name": "F5_rs_0.1_b10",
+    "probs": {
+      "warmup_vla": 0.2,
+      "human_expert": 0.4,
+      "rl_rollout": 0.4
+    },
+    "beta": 10.0,
+    "gradient_steps": 30000
+  },
+  {
+    "name": "F6_rs_0.1_b1",
+    "probs": {
+      "warmup_vla": 0.2,
+      "human_expert": 0.4,
+      "rl_rollout": 0.4
+    },
+    "beta": 1.0,
+    "gradient_steps": 30000
+  },
+  {
+    "name": "F7_rs_0.1_human_heavy",
+    "probs": {
+      "warmup_vla": 0.1,
+      "human_expert": 0.6,
+      "rl_rollout": 0.3
+    },
+    "gradient_steps": 30000
+  },
+  {
+    "name": "F8_rs_0.1_rl_heavy",
+    "probs": {
+      "warmup_vla": 0.1,
+      "human_expert": 0.3,
+      "rl_rollout": 0.6
+    },
+    "gradient_steps": 30000
+  },
+  {
+    "name": "F9_rs_0.1_bucket1",
+    "probs": {
+      "warmup_vla": 1.0,
+      "human_expert": 0.0,
+      "rl_rollout": 0.0
+    },
+    "gradient_steps": 30000
+  },
+  {
+    "name": "F10_rs_0.0",
+    "probs": {
+      "warmup_vla": 0.2,
+      "human_expert": 0.4,
+      "rl_rollout": 0.4
+    },
+    "gradient_steps": 30000
+  }
+]

@@ -51,7 +51,7 @@ def build_reward_seq(
     episode_success: bool = True,
     is_terminal_chunk: bool = False,
     actual_steps: int | torch.Tensor | None = None,
-    success_bonus: float = 10.0,
+    success_bonus: float = 1.0,
     progress_scale: float = 1.0,
 ) -> torch.Tensor:
     """Build a (C,) reward sequence for a single chunk transition.
