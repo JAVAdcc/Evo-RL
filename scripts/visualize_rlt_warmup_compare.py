@@ -501,28 +501,9 @@ const CAM_LABELS = {json.dumps(cam_labels)};
 const FRAME_W = {fw};
 const FRAME_H = {fh};
 
-const imgCache = {{}};
-CAM_LABELS.forEach(c => {{ imgCache[c] = new Array(VID_N); }});
-
-function preloadFrame(camLabel, idx) {{
-  if (imgCache[camLabel][idx]) return imgCache[camLabel][idx];
-  const img = new Image();
-  img.src = 'data:image/jpeg;base64,' + VID_FRAMES[camLabel][idx];
-  imgCache[camLabel][idx] = img;
-  return img;
-}}
-
-// preload first batch
-CAM_LABELS.forEach(c => {{
-  for (let i = 0; i < Math.min(VID_N, 20); i++) preloadFrame(c, i);
-}});
-
-const canvasMap = {{}};
 const ctxMap = {{}};
 CAM_LABELS.forEach(lbl => {{
-  const cv = document.getElementById('cam-' + lbl);
-  canvasMap[lbl] = cv;
-  ctxMap[lbl] = cv.getContext('2d');
+  ctxMap[lbl] = document.getElementById('cam-' + lbl).getContext('2d');
 }});
 
 // precompute Q min/max once
@@ -537,38 +518,21 @@ if (Q_VALUES) {{
 
 let vidPlaying = false;
 let vidFrame = 0;
-let vidAnimId = null;
-let lastFrameTime = 0;
 const playBtn = document.getElementById('play-btn');
 const frameSlider = document.getElementById('frame-slider');
 const frameInfo = document.getElementById('frame-info');
 
-function renderFrame(ctx, img, idx) {{
-  ctx.clearRect(0, 0, FRAME_W, FRAME_H);
-  ctx.drawImage(img, 0, 0, FRAME_W, FRAME_H);
-  if (Q_VALUES) drawQOverlay(ctx, FRAME_W, FRAME_H, idx);
-}}
-
 function drawVideoFrame(idx) {{
-  // preload nearby
-  const ahead = 10;
-  CAM_LABELS.forEach(c => {{
-    for (let i = idx; i < Math.min(VID_N, idx + ahead); i++) preloadFrame(c, i);
-  }});
-
   CAM_LABELS.forEach(lbl => {{
     const ctx = ctxMap[lbl];
-    const img = preloadFrame(lbl, idx);
-    // use decode() for reliable async decoding, fall back to onload
-    if (img.decode) {{
-      img.decode().then(() => renderFrame(ctx, img, idx)).catch(() => renderFrame(ctx, img, idx));
-    }} else if (img.complete && img.naturalWidth > 0) {{
-      renderFrame(ctx, img, idx);
-    }} else {{
-      img.onload = () => renderFrame(ctx, img, idx);
-    }}
+    const img = new Image();
+    img.onload = function() {{
+      ctx.clearRect(0, 0, FRAME_W, FRAME_H);
+      ctx.drawImage(this, 0, 0, FRAME_W, FRAME_H);
+      if (Q_VALUES) drawQOverlay(ctx, FRAME_W, FRAME_H, idx);
+    }};
+    img.src = 'data:image/jpeg;base64,' + VID_FRAMES[lbl][idx];
   }});
-
   const t = (idx * VID_STRIDE / VID_FPS).toFixed(2);
   frameInfo.textContent = 'frame ' + idx + '/' + (VID_N - 1) + '  t=' + t + 's'
     + (Q_VALUES ? '  Q=' + Q_VALUES[idx].toFixed(4) : '');
@@ -612,30 +576,25 @@ function drawQOverlay(ctx, w, h, currentIdx) {{
   ctx.fillText(qMin.toFixed(3), w - 52, h - 4);
 }}
 
+let vidInterval = null;
+
 frameSlider.addEventListener('input', () => {{
   vidFrame = parseInt(frameSlider.value, 10);
   drawVideoFrame(vidFrame);
 }});
 
-function vidLoop(ts) {{
-  if (!vidPlaying) return;
-  if (ts - lastFrameTime >= 1000 / (VID_FPS / VID_STRIDE)) {{
-    lastFrameTime = ts;
-    vidFrame++;
-    if (vidFrame >= VID_N) {{ vidFrame = 0; }}
-    drawVideoFrame(vidFrame);
-  }}
-  vidAnimId = requestAnimationFrame(vidLoop);
-}}
-
 playBtn.addEventListener('click', () => {{
   vidPlaying = !vidPlaying;
   playBtn.textContent = vidPlaying ? 'Pause' : 'Play';
   if (vidPlaying) {{
-    lastFrameTime = performance.now();
-    vidAnimId = requestAnimationFrame(vidLoop);
-  }} else if (vidAnimId) {{
-    cancelAnimationFrame(vidAnimId);
+    vidInterval = setInterval(() => {{
+      vidFrame++;
+      if (vidFrame >= VID_N) vidFrame = 0;
+      drawVideoFrame(vidFrame);
+    }}, Math.round(1000 * VID_STRIDE / VID_FPS));
+  }} else {{
+    clearInterval(vidInterval);
+    vidInterval = null;
   }}
 }});
 
