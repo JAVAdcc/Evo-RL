@@ -372,26 +372,46 @@ def extract_video_frames(
     camera_full_keys: list[str],
     stride: int,
     target_width: int,
-) -> dict[str, list[str]]:
-    """Extract video frames as base64 JPEG strings per camera key."""
+) -> tuple[dict[str, list[str]], tuple[int, int]]:
+    """Extract video frames as base64 JPEG strings per camera key.
+
+    Cameras whose first frame has near-zero variance (blank/disconnected)
+    are automatically skipped.
+
+    Returns (frames_dict, (frame_w, frame_h)).
+    """
     from PIL import Image
 
-    frames: dict[str, list[str]] = {key: [] for key in camera_full_keys}
+    # detect blank cameras by checking first frame variance
+    item0 = dataset[0]
+    active_keys = []
+    for full_key in camera_full_keys:
+        img_t = item0[full_key]
+        if img_t.std().item() < 0.001:
+            log.warning("Skipping blank camera: %s (std=%.4f)", full_key, img_t.std().item())
+        else:
+            active_keys.append(full_key)
+
+    frames: dict[str, list[str]] = {key: [] for key in active_keys}
     frame_indices = list(range(0, len(dataset), stride))
-    log.info("Extracting %d video frames from %d cameras", len(frame_indices), len(camera_full_keys))
+    h_orig, w_orig = item0[active_keys[0]].shape[1], item0[active_keys[0]].shape[2]
+    target_h = int(h_orig * target_width / w_orig)
+    log.info(
+        "Extracting %d video frames from %d cameras (%d blank skipped), %dx%d",
+        len(frame_indices), len(active_keys),
+        len(camera_full_keys) - len(active_keys), target_width, target_h,
+    )
     for index in tqdm(frame_indices, desc="Frames"):
         item = dataset[index]
-        for full_key in camera_full_keys:
+        for full_key in active_keys:
             img_t = item[full_key]  # (C, H, W) float [0,1]
             img_np = (img_t.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
             img = Image.fromarray(img_np)
-            h_orig, w_orig = img_np.shape[:2]
-            target_h = int(h_orig * target_width / w_orig)
             img = img.resize((target_width, target_h), Image.LANCZOS)
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=75)
             frames[full_key].append(base64.b64encode(buf.getvalue()).decode())
-    return frames
+    return frames, (target_width, target_h)
 
 
 def build_stats_html(
@@ -435,10 +455,12 @@ def _build_video_section(
     q_values: np.ndarray | None,
     fps: float,
     stride: int,
+    frame_size: tuple[int, int],
 ) -> tuple[str, str]:
     """Return (video_html, video_js) for the camera + Q-value overlay."""
     first_key = list(video_frames.keys())[0]
     n_frames = len(video_frames[first_key])
+    fw, fh = frame_size
 
     frames_json = json.dumps({
         k.split(".")[-1]: v for k, v in video_frames.items()
@@ -449,7 +471,8 @@ def _build_video_section(
     canvases_html = "\n".join(
         f'<div style="text-align:center;">'
         f'<div style="font-size:13px;font-weight:600;margin-bottom:4px;">{lbl}</div>'
-        f'<canvas id="cam-{lbl}" style="border:1px solid #ccc;max-width:100%;"></canvas>'
+        f'<canvas id="cam-{lbl}" width="{fw}" height="{fh}"'
+        f' style="border:1px solid #ccc;max-width:100%;"></canvas>'
         f'</div>'
         for lbl in cam_labels
     )
@@ -475,6 +498,8 @@ const VID_N = {n_frames};
 const VID_FPS = {fps};
 const VID_STRIDE = {stride};
 const CAM_LABELS = {json.dumps(cam_labels)};
+const FRAME_W = {fw};
+const FRAME_H = {fh};
 
 const imgCache = {{}};
 CAM_LABELS.forEach(c => {{ imgCache[c] = new Array(VID_N); }});
@@ -487,7 +512,7 @@ function preloadFrame(camLabel, idx) {{
   return img;
 }}
 
-// preload first few frames immediately
+// preload first batch
 CAM_LABELS.forEach(c => {{
   for (let i = 0; i < Math.min(VID_N, 20); i++) preloadFrame(c, i);
 }});
@@ -500,6 +525,16 @@ CAM_LABELS.forEach(lbl => {{
   ctxMap[lbl] = cv.getContext('2d');
 }});
 
+// precompute Q min/max once
+let qMin = 0, qMax = 0;
+if (Q_VALUES) {{
+  qMin = Q_VALUES[0]; qMax = Q_VALUES[0];
+  for (let i = 1; i < Q_VALUES.length; i++) {{
+    if (Q_VALUES[i] < qMin) qMin = Q_VALUES[i];
+    if (Q_VALUES[i] > qMax) qMax = Q_VALUES[i];
+  }}
+}}
+
 let vidPlaying = false;
 let vidFrame = 0;
 let vidAnimId = null;
@@ -508,26 +543,30 @@ const playBtn = document.getElementById('play-btn');
 const frameSlider = document.getElementById('frame-slider');
 const frameInfo = document.getElementById('frame-info');
 
+function renderFrame(ctx, img, idx) {{
+  ctx.clearRect(0, 0, FRAME_W, FRAME_H);
+  ctx.drawImage(img, 0, 0, FRAME_W, FRAME_H);
+  if (Q_VALUES) drawQOverlay(ctx, FRAME_W, FRAME_H, idx);
+}}
+
 function drawVideoFrame(idx) {{
-  // preload nearby frames
+  // preload nearby
   const ahead = 10;
   CAM_LABELS.forEach(c => {{
     for (let i = idx; i < Math.min(VID_N, idx + ahead); i++) preloadFrame(c, i);
   }});
 
   CAM_LABELS.forEach(lbl => {{
-    const cv = canvasMap[lbl];
     const ctx = ctxMap[lbl];
     const img = preloadFrame(lbl, idx);
-
-    const draw = () => {{
-      cv.width = img.naturalWidth || img.width || 320;
-      cv.height = img.naturalHeight || img.height || 240;
-      ctx.drawImage(img, 0, 0);
-      if (Q_VALUES) drawQOverlay(ctx, cv.width, cv.height, idx);
-    }};
-    if (img.complete) {{ draw(); }}
-    else {{ img.onload = draw; }}
+    // use decode() for reliable async decoding, fall back to onload
+    if (img.decode) {{
+      img.decode().then(() => renderFrame(ctx, img, idx)).catch(() => renderFrame(ctx, img, idx));
+    }} else if (img.complete && img.naturalWidth > 0) {{
+      renderFrame(ctx, img, idx);
+    }} else {{
+      img.onload = () => renderFrame(ctx, img, idx);
+    }}
   }});
 
   const t = (idx * VID_STRIDE / VID_FPS).toFixed(2);
@@ -539,16 +578,12 @@ function drawVideoFrame(idx) {{
 function drawQOverlay(ctx, w, h, currentIdx) {{
   const barH = 50;
   const barY = h - barH;
-  // semi-transparent background
   ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
   ctx.fillRect(0, barY, w, barH);
 
-  const qMin = Math.min(...Q_VALUES);
-  const qMax = Math.max(...Q_VALUES);
   const qRange = qMax - qMin || 1;
   const pad = 5;
 
-  // draw Q curve
   ctx.beginPath();
   ctx.strokeStyle = '#FFD700';
   ctx.lineWidth = 2;
@@ -560,7 +595,6 @@ function drawQOverlay(ctx, w, h, currentIdx) {{
   }}
   ctx.stroke();
 
-  // current position marker
   const curX = (currentIdx / (VID_N - 1)) * w;
   ctx.beginPath();
   ctx.strokeStyle = 'rgba(255, 80, 80, 0.9)';
@@ -569,11 +603,9 @@ function drawQOverlay(ctx, w, h, currentIdx) {{
   ctx.lineTo(curX, h);
   ctx.stroke();
 
-  // Q value text
   ctx.fillStyle = '#FFD700';
   ctx.font = 'bold 12px monospace';
   ctx.fillText('Q: ' + Q_VALUES[currentIdx].toFixed(4), 4, barY + 14);
-  // min/max labels
   ctx.fillStyle = 'rgba(255,255,255,0.6)';
   ctx.font = '10px monospace';
   ctx.fillText(qMax.toFixed(3), w - 52, barY + 12);
@@ -626,6 +658,7 @@ def build_html(
     window_size: int,
     stats_html: str,
     title: str,
+    frame_size: tuple[int, int] = (320, 240),
 ) -> str:
     time_s = (np.arange(gt.shape[0]) * stride / fps).tolist()
     series = {
@@ -672,7 +705,7 @@ def build_html(
     video_js = ""
     if video_frames:
         video_html, video_js = _build_video_section(
-            camera_keys, video_frames, q_values, fps, stride,
+            camera_keys, video_frames, q_values, fps, stride, frame_size,
         )
 
     return f"""<!DOCTYPE html>
@@ -802,8 +835,9 @@ def main() -> None:
     gt_actions = gt_actions[:, :12]
 
     video_frames = None
+    frame_size = (args.video_width, 240)
     if not args.no_video:
-        video_frames = extract_video_frames(dataset, camera_full_keys, args.stride, args.video_width)
+        video_frames, frame_size = extract_video_frames(dataset, camera_full_keys, args.stride, args.video_width)
 
     vla_actions = None
     if not args.no_vla:
@@ -857,6 +891,7 @@ def main() -> None:
         window_size=args.window_size,
         stats_html=stats_html,
         title=f"Episode {args.episode_index}: GT vs VLA vs RL",
+        frame_size=frame_size,
     )
     output_path = Path(args.output)
     output_path.write_text(html, encoding="utf-8")
