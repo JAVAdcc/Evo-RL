@@ -188,6 +188,11 @@ def run_experiment(
         actor_optimizer=actor_opt,
         critic_optimizer=critic_opt,
         save_dir=str(save_dir),
+        metadata={
+            "rl_token_checkpoint": args.rl_token_checkpoint,
+            "bucket_paths": bucket_paths,
+            "warm_start_ckpt": exp.warm_start_ckpt,
+        },
     )
     elapsed = time.time() - start
 
@@ -206,6 +211,10 @@ def run_experiment(
     result = {
         "name": exp.name,
         "config": exp.__dict__,
+        "provenance": {
+            "rl_token_checkpoint": args.rl_token_checkpoint,
+            "bucket_paths": bucket_paths,
+        },
         "elapsed_sec": elapsed,
         "final_actor_loss": _mean_tail(metrics.actor_losses, 500),
         "final_critic_loss": _mean_tail(metrics.critic_losses, 500),

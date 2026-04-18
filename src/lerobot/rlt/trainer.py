@@ -45,6 +45,7 @@ def demo_adaptation(
     save_every: int = 2000,
     start_step: int = 0,
     prior_losses: list[float] | None = None,
+    metadata: dict | None = None,
 ) -> list[float]:
     """Demo adaptation phase: L_ro + alpha * L_vla.
 
@@ -110,7 +111,7 @@ def demo_adaptation(
 
         # Periodic checkpoint
         if save_dir and step > 0 and step % save_every == 0:
-            _save_checkpoint(rl_token_full, losses, step, save_dir)
+            _save_checkpoint(rl_token_full, losses, step, save_dir, metadata)
 
         # Periodic memory cleanup
         if step % 500 == 0:
@@ -124,7 +125,7 @@ def demo_adaptation(
 
     # Final save
     if save_dir:
-        _save_checkpoint(rl_token_full, losses, step, save_dir)
+        _save_checkpoint(rl_token_full, losses, step, save_dir, metadata)
 
     policy.freeze_vla()
     policy.freeze_rl_token_encoder()
@@ -133,18 +134,21 @@ def demo_adaptation(
     return losses
 
 
-def _save_checkpoint(rl_token_full, losses: list[float], step: int, save_dir: str) -> None:
+def _save_checkpoint(rl_token_full, losses: list[float], step: int, save_dir: str, metadata: dict | None = None) -> None:
     """Save training checkpoint."""
     import json
     from pathlib import Path
 
     path = Path(save_dir)
     path.mkdir(parents=True, exist_ok=True)
-    torch.save({
+    ckpt = {
         "rl_token_state_dict": rl_token_full.state_dict(),
         "step": step,
         "losses": losses,
-    }, path / "demo_adapt_checkpoint.pt")
+    }
+    if metadata:
+        ckpt["metadata"] = metadata
+    torch.save(ckpt, path / "demo_adapt_checkpoint.pt")
     with open(path / "losses.json", "w") as f:
         json.dump(losses, f)
     logger.info("Checkpoint saved at step %d to %s (loss=%.4f)", step, save_dir, losses[-1] if losses else 0)
@@ -244,13 +248,14 @@ def _save_rl_checkpoint(
     step: int,
     metrics: TrainingMetrics,
     save_dir: str,
+    metadata: dict | None = None,
 ) -> None:
     """Save RL training checkpoint (actor, critic, target, optimizers, step, metrics)."""
     from pathlib import Path
 
     path = Path(save_dir)
     path.mkdir(parents=True, exist_ok=True)
-    torch.save({
+    ckpt = {
         "actor_state_dict": algorithm.policy.actor.state_dict(),
         "critic_state_dict": algorithm.critic.state_dict(),
         "target_critic_state_dict": algorithm.target_critic.state_dict(),
@@ -259,7 +264,10 @@ def _save_rl_checkpoint(
         "step": step,
         "critic_losses": metrics.critic_losses,
         "actor_losses": metrics.actor_losses,
-    }, path / "rl_checkpoint.pt")
+    }
+    if metadata:
+        ckpt["metadata"] = metadata
+    torch.save(ckpt, path / "rl_checkpoint.pt")
     logger.info("RL checkpoint saved at step %d to %s", step, save_dir)
 
 
@@ -276,6 +284,7 @@ def offline_rl_loop(
     actor_optimizer: torch.optim.Optimizer | None = None,
     critic_optimizer: torch.optim.Optimizer | None = None,
     save_dir: str | None = None,
+    metadata: dict | None = None,
 ) -> TrainingMetrics:
     """Offline RL training loop: gradient steps on a fixed replay buffer."""
     if actor_optimizer is None:
@@ -320,10 +329,10 @@ def offline_rl_loop(
             logger.info("Step %d  val_critic=%.4f", step, val_c.item())
 
         if save_dir and step % off_cfg.save_every == 0:
-            _save_rl_checkpoint(algorithm, actor_optimizer, critic_optimizer, step, metrics, save_dir)
+            _save_rl_checkpoint(algorithm, actor_optimizer, critic_optimizer, step, metrics, save_dir, metadata)
 
     if save_dir:
-        _save_rl_checkpoint(algorithm, actor_optimizer, critic_optimizer, off_cfg.num_gradient_steps, metrics, save_dir)
+        _save_rl_checkpoint(algorithm, actor_optimizer, critic_optimizer, off_cfg.num_gradient_steps, metrics, save_dir, metadata)
 
     logger.info(
         "Offline RL done. %d gradient steps, %d critic updates, %d actor updates",
