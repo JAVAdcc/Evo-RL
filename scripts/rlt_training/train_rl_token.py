@@ -109,6 +109,7 @@ def main() -> None:
         save_every=args.save_every,
         start_step=start_step,
         prior_losses=prior_losses,
+        metadata={"vla_model": args.model_path, "dataset": args.demo_dataset_path},
     )
     elapsed = time.time() - start_time
     final_loss = losses[-1] if losses else 0.0
