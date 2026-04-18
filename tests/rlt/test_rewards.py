@@ -28,10 +28,10 @@ def test_terminal_mode():
     expert, exec_ = _make_chunks()
     reward = build_reward_seq(
         expert, exec_, mode="terminal", episode_success=True,
-        is_terminal_chunk=True, success_bonus=5.0,
+        is_terminal_chunk=True,
     )
     assert reward.shape == (C,)
-    assert reward[-1].item() == pytest.approx(5.0)
+    assert reward[-1].item() == pytest.approx(1.0)
     assert reward[:-1].abs().sum().item() == 0.0
 
 
@@ -40,11 +40,11 @@ def test_hybrid_mode():
     matching = build_reward_seq(expert, exec_, mode="action_matching")
     terminal = build_reward_seq(
         expert, exec_, mode="terminal", episode_success=True,
-        is_terminal_chunk=True, success_bonus=10.0,
+        is_terminal_chunk=True,
     )
     hybrid = build_reward_seq(
         expert, exec_, mode="hybrid", episode_success=True,
-        is_terminal_chunk=True, success_bonus=10.0,
+        is_terminal_chunk=True,
     )
     assert torch.allclose(hybrid, matching + terminal, atol=1e-6)
 
@@ -63,7 +63,7 @@ def test_no_terminal_when_not_terminal_chunk():
     expert, exec_ = _make_chunks()
     reward = build_reward_seq(
         expert, exec_, mode="terminal", episode_success=True,
-        is_terminal_chunk=False, success_bonus=10.0,
+        is_terminal_chunk=False,
     )
     assert reward.abs().sum().item() == 0.0
 

@@ -19,13 +19,12 @@ def _terminal_reward(
     episode_success: bool,
     is_terminal_chunk: bool,
     actual_steps: int,
-    success_bonus: float,
     device: torch.device,
 ) -> torch.Tensor:
-    """(C,) reward with optional terminal bonus at the last valid step."""
+    """(C,) reward with terminal bonus of 1.0 at the last valid step."""
     reward = torch.zeros(chunk_size, device=device)
     if is_terminal_chunk and episode_success and actual_steps > 0:
-        reward[actual_steps - 1] = success_bonus
+        reward[actual_steps - 1] = 1.0
     return reward
 
 
@@ -51,7 +50,6 @@ def build_reward_seq(
     episode_success: bool = True,
     is_terminal_chunk: bool = False,
     actual_steps: int | torch.Tensor | None = None,
-    success_bonus: float = 1.0,
     progress_scale: float = 1.0,
 ) -> torch.Tensor:
     """Build a (C,) reward sequence for a single chunk transition.
@@ -64,7 +62,6 @@ def build_reward_seq(
         is_terminal_chunk: Whether this is the last chunk in the episode.
         actual_steps: Number of valid steps in chunk (rest are padding).
             Accepts int, scalar Tensor, or None (meaning all C steps valid).
-        success_bonus: Bonus value for terminal success.
         progress_scale: Scaling factor for action-matching reward.
 
     Returns:
@@ -81,7 +78,7 @@ def build_reward_seq(
     steps = _resolve_actual_steps(C, actual_steps)
 
     if mode == "terminal":
-        return _terminal_reward(C, episode_success, is_terminal_chunk, steps, success_bonus, expert_chunk.device)
+        return _terminal_reward(C, episode_success, is_terminal_chunk, steps, expert_chunk.device)
 
     matching = _action_matching_reward(expert_chunk, exec_chunk, steps, progress_scale)
 
@@ -89,5 +86,5 @@ def build_reward_seq(
         return matching
 
     # hybrid: action_matching + terminal bonus
-    terminal = _terminal_reward(C, episode_success, is_terminal_chunk, steps, success_bonus, expert_chunk.device)
+    terminal = _terminal_reward(C, episode_success, is_terminal_chunk, steps, expert_chunk.device)
     return matching + terminal

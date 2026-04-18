@@ -55,7 +55,6 @@ def build_transitions_from_demos(
     is_critical: float = 0.0,
     stride: int = 1,
     episode_success: bool = True,
-    success_bonus: float = 1.0,
 ) -> list[ChunkTransition]:
     """Build ChunkTransitions from a *single-episode* sequential demo loader.
 
@@ -102,7 +101,6 @@ def build_transitions_from_demos(
         chunk_length,
         stride=stride,
         episode_success=episode_success,
-        success_bonus=success_bonus,
         source=source,
         episode_id=episode_id,
         is_critical=is_critical,
@@ -116,7 +114,6 @@ def _encoded_to_transitions(
     chunk_length: int,
     stride: int = 1,
     episode_success: bool = True,
-    success_bonus: float = 1.0,
     source: int = 0,
     episode_id: int = -1,
     is_critical: float = 0.0,
@@ -156,7 +153,6 @@ def _encoded_to_transitions(
             chunk_length=chunk_length,
             is_terminal=is_terminal,
             episode_success=episode_success,
-            success_bonus=success_bonus,
         )
         transitions.append(ChunkTransition(
             state_vec=s, exec_chunk=e, ref_chunk=r, reward_seq=rew,
@@ -274,7 +270,6 @@ def build_transition_replay_buffer(
             device=device,
             episode_id=ep_id,
             stride=off_cfg.frame_stride,
-            success_bonus=off_cfg.success_bonus,
         )
         for t in transitions:
             buf.add(t)
@@ -343,12 +338,11 @@ def _terminal_reward_seq(
     chunk_length: int,
     is_terminal: bool,
     episode_success: bool,
-    success_bonus: float,
 ) -> torch.Tensor:
-    """Return step-level sparse terminal reward aggregated over a chunk."""
+    """Return step-level sparse terminal reward of 1.0 for a chunk."""
     reward = torch.zeros(chunk_length)
     if is_terminal and episode_success:
-        reward[-1] = success_bonus
+        reward[-1] = 1.0
     return reward
 
 

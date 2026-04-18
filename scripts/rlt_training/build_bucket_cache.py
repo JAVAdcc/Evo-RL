@@ -37,7 +37,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default=None)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--mark-critical", action="store_true")
-    parser.add_argument("--success-bonus", type=float, default=1.0)
     parser.add_argument("--token-pool-size", type=int, default=64)
     parser.add_argument("--task-instruction", default="Insert the copper screw into the black sleeve.")
     parser.add_argument("--frame-stride", type=int, default=2)
@@ -85,7 +84,6 @@ def main() -> None:
 
     config = load_training_config(args.config)
     config.offline_rl.frame_stride = args.frame_stride
-    config.offline_rl.success_bonus = args.success_bonus
     config.offline_rl.train_ratio = args.train_ratio
     config.offline_rl.val_ratio = args.val_ratio
 
@@ -167,7 +165,6 @@ def main() -> None:
                 episode_id=episode_id,
                 is_critical=float(args.mark_critical),
                 stride=config.offline_rl.frame_stride,
-                success_bonus=config.offline_rl.success_bonus,
                 source=_bucket_source_id(args.bucket_mode),
             )
 

@@ -95,7 +95,6 @@ def test_build_transitions_basic():
         episode_last_frame=4,
         chunk_length=C,
         stride=1,
-        success_bonus=1.0,
     )
     assert len(transitions) == 2
 
@@ -138,7 +137,6 @@ def test_build_transitions_stride_uses_c_step_bootstrap():
         episode_last_frame=8,
         chunk_length=C,
         stride=stride,
-        success_bonus=1.0,
     )
 
     assert len(transitions) == 3
@@ -179,7 +177,6 @@ def test_encoded_to_transitions_accepts_irregular_terminal_anchor():
         episode_last_frame=13,
         chunk_length=C,
         stride=stride,
-        success_bonus=1.0,
     )
 
     assert [frame_indices[i] for i in range(len(frame_indices)) if frame_indices[i] + C <= 13] == [0, 2, 3]
