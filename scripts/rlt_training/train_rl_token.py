@@ -20,7 +20,7 @@ logger = configure_logging(__name__)
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the RL token module on a raw demo dataset.")
     parser.add_argument("--model-path", default="lerobot/pi05_base")
-    parser.add_argument("--demo-dataset-path", required=True)
+    parser.add_argument("--demo-dataset-path", default=None)
     parser.add_argument("--config", default=None, help="Path to an RLT YAML config.")
     parser.add_argument("--output-dir", default="outputs/rl_token")
     parser.add_argument("--device", default="cuda")

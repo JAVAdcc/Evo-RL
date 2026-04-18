@@ -33,7 +33,7 @@ class RLTDemoDataset(Dataset):
 
     def __init__(
         self,
-        dataset_path: str,
+        dataset_path: str | None = None,
         repo_id: str = "rlt_demo",
         chunk_length: int = 50,
         camera_keys: list[str] | None = None,
@@ -51,6 +51,7 @@ class RLTDemoDataset(Dataset):
         self._dataset = LeRobotDataset(
             repo_id=repo_id,
             root=dataset_path,
+            revision="main",
             delta_timestamps=delta_timestamps,
             video_backend="pyav",
         )
@@ -95,11 +96,11 @@ class RLTDemoDataset(Dataset):
                 if attr_prefix == "_action":
                     self._normalize_actions = False
 
-    def _read_fps(self, dataset_path: str, repo_id: str) -> float:
+    def _read_fps(self, dataset_path: str | None, repo_id: str) -> float:
         """Read fps from the dataset metadata."""
         from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 
-        meta = LeRobotDatasetMetadata(repo_id=repo_id, root=dataset_path)
+        meta = LeRobotDatasetMetadata(repo_id=repo_id, root=dataset_path, revision="main")
         return meta.fps
 
     def _detect_camera_keys(self) -> list[str]:
@@ -176,8 +177,8 @@ def rlt_demo_collate(batch: list[dict]) -> tuple[Observation, torch.Tensor]:
 
 
 def make_demo_loader(
-    dataset_path: str,
-    batch_size: int,
+    dataset_path: str | None = None,
+    batch_size: int = 32,
     chunk_length: int = 50,
     repo_id: str = "rlt_demo",
     camera_keys: list[str] | None = None,

@@ -29,7 +29,7 @@ logger = configure_logging(__name__)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--demo-dataset-path", required=True)
+    parser.add_argument("--demo-dataset-path", default=None)
     parser.add_argument("--transition-cache-dir", required=True)
     parser.add_argument("--bucket-mode", choices=["warmup_vla", "human_expert", "rl_rollout"], required=True)
     parser.add_argument("--model-path", default="lerobot/pi05_base")

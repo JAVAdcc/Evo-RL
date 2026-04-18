@@ -207,7 +207,7 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", default="Elvinky/pi05_screw_271ep_sft_fp32")
-    parser.add_argument("--dataset-path", required=True)
+    parser.add_argument("--dataset-path", default=None)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output-dir", default="outputs/rl_token_search")
     parser.add_argument("--dtype", default="float32", choices=["bfloat16", "float32"])

@@ -40,7 +40,7 @@ class PlaceholderEncoder:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build a chunk-transition cache from a raw demo dataset.")
-    parser.add_argument("--demo-dataset-path", required=True, help="Path to the raw LeRobot demo dataset.")
+    parser.add_argument("--demo-dataset-path", default=None, help="Path to the raw LeRobot demo dataset.")
     parser.add_argument("--transition-cache-dir", required=True, help="Output directory for chunk-transition cache files.")
     parser.add_argument("--model-path", default="lerobot/pi05_base", help="Pi0.5 model path.")
     parser.add_argument("--rl-token-checkpoint", default=None, help="RL token checkpoint used for observation encoding.")

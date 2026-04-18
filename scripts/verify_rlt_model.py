@@ -18,7 +18,7 @@ Usage:
     --vla-model Elvinky/pi05_screw_271ep_sft_fp32 \
     --rl-token-ckpt outputs/rlt_demo_adapt_271ep_sft_fp32/demo_adapt_checkpoint.pt \
     --ac-ckpt outputs/exp_s2_b0.3/rl_checkpoint.pt \
-    --dataset-path /home/coder/share/dataset
+    --repo-id Shiki42/sft_pi05_screw_rollout_success_critical_phase_filtered_405ep
 """
 from __future__ import annotations
 
