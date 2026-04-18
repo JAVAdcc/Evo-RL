@@ -186,6 +186,7 @@ dev_plan.md
 .claude/
 docs/.claude/
 CLAUDE.md
+CURRENT.md
 
 # Local replay datasets
 replay/
