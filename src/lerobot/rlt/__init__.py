@@ -20,7 +20,7 @@ from lerobot.rlt.utils import (
 from lerobot.rlt.policy import RLTPolicy
 from lerobot.rlt.algorithm import RLTAlgorithm
 from lerobot.rlt.collector import Environment, DummyEnvironment, execute_chunk
-from lerobot.rlt.rewards import build_reward_seq, REWARD_MODES
+from lerobot.rlt.rewards import build_reward_seq
 
 __all__ = [
     "ChunkTransition",
@@ -51,5 +51,4 @@ __all__ = [
     "DummyEnvironment",
     "execute_chunk",
     "build_reward_seq",
-    "REWARD_MODES",
 ]

@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader, Subset
 from lerobot.rlt.demo_loader import RLTDemoDataset, rlt_demo_collate
 from lerobot.rlt.interfaces import ChunkTransition, Observation
 from lerobot.rlt.replay_buffer import ReplayBuffer
+from lerobot.rlt.rewards import build_reward_seq
 
 logger = logging.getLogger(__name__)
 
@@ -149,9 +150,9 @@ def _encoded_to_transitions(
         s, r, e = encoded[idx]
         ns, nr = encoded[next_idx][0], encoded[next_idx][1]
         is_terminal = next_frame == episode_last_frame
-        rew = _terminal_reward_seq(
+        rew = build_reward_seq(
             chunk_length=chunk_length,
-            is_terminal=is_terminal,
+            is_terminal_chunk=is_terminal,
             episode_success=episode_success,
         )
         transitions.append(ChunkTransition(
@@ -333,17 +334,6 @@ def _subsample_chunk(actions: torch.Tensor, target_len: int) -> torch.Tensor:
     """Take first target_len frames from action trajectory (H, D) -> (target_len, D)."""
     return actions[:target_len]
 
-
-def _terminal_reward_seq(
-    chunk_length: int,
-    is_terminal: bool,
-    episode_success: bool,
-) -> torch.Tensor:
-    """Return step-level sparse terminal reward of 1.0 for a chunk."""
-    reward = torch.zeros(chunk_length)
-    if is_terminal and episode_success:
-        reward[-1] = 1.0
-    return reward
 
 
 def _episode_frame_range(dataset: RLTDemoDataset, ep_id: int) -> tuple[int, int]:
