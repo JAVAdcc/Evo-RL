@@ -17,6 +17,7 @@ import glob
 import importlib
 import logging
 import shutil
+import subprocess
 import tempfile
 import warnings
 from dataclasses import dataclass, field
@@ -448,23 +449,20 @@ def concatenate_video_files(
     input_video_paths: list[Path | str], output_video_path: Path, overwrite: bool = True
 ):
     """
-    Concatenate multiple video files into a single video file using pyav.
+    Concatenate multiple video files into a single video file.
 
-    This function takes a list of video input file paths and concatenates them into a single
-    output video file. It uses ffmpeg's concat demuxer with stream copy mode for fast
-    concatenation without re-encoding.
+    Fast path: ffmpeg concat demuxer with stream copy (no re-encode), used only
+    when every input shares identical codec, resolution, pixel format, framerate,
+    and codec extradata (SPS/PPS). Any divergence forces a safe-path re-encode
+    via ffmpeg CLI, because stream-copy concat of non-uniform inputs silently
+    corrupts the output: subsequent packets are muxed against the first stream's
+    codec parameters and pyav drops or mis-interprets them, producing a truncated
+    or undecodable file.
 
-    Args:
-        input_video_paths: Ordered list of input video file paths to concatenate.
-        output_video_path: Path to the output video file.
-        overwrite: Whether to overwrite the output video file if it already exists. Default is True.
-
-    Note:
-        - Creates a temporary directory for intermediate files that is cleaned up after use.
-        - Uses ffmpeg's concat demuxer which requires all input videos to have the same
-          codec, resolution, and frame rate for proper concatenation.
+    The output is always verified against the sum of input durations; a mismatch
+    raises RuntimeError so the caller sees the failure at merge time rather than
+    discovering it later during training.
     """
-
     output_video_path = Path(output_video_path)
 
     if output_video_path.exists() and not overwrite:
@@ -476,53 +474,126 @@ def concatenate_video_files(
     if len(input_video_paths) == 0:
         raise FileNotFoundError("No input video paths provided.")
 
-    # Create a temporary .ffconcat file to list the input video paths
+    input_paths = [Path(p) for p in input_video_paths]
+    expected_total = sum(get_video_duration_in_s(p) for p in input_paths)
+
+    if _concat_inputs_are_uniform(input_paths):
+        _concat_stream_copy_pyav(input_paths, output_video_path)
+    else:
+        logging.warning(
+            "concatenate_video_files: inputs have non-uniform stream parameters; "
+            "falling back to libx264 re-encode for safe concatenation (%d files -> %s)",
+            len(input_paths),
+            output_video_path,
+        )
+        _concat_reencode_ffmpeg(input_paths, output_video_path)
+
+    actual = get_video_duration_in_s(output_video_path)
+    if abs(actual - expected_total) > 0.5:
+        raise RuntimeError(
+            f"concatenate_video_files: output duration {actual:.3f}s does not match "
+            f"sum of input durations {expected_total:.3f}s "
+            f"(delta={actual - expected_total:+.3f}s). "
+            f"inputs={[str(p) for p in input_paths]} output={output_video_path}"
+        )
+
+
+def _concat_inputs_are_uniform(input_paths: list[Path]) -> bool:
+    """Return True only when every input video stream is byte-compatible for stream copy.
+
+    Compares codec name, resolution, pixel format, framerate, and codec extradata
+    (SPS/PPS for H264). Inputs that pass this check can be concatenated with
+    stream copy without risk of silent packet drop at the boundary.
+    """
+    fingerprints = []
+    for p in input_paths:
+        with av.open(str(p)) as container:
+            vs = next((s for s in container.streams if s.type == "video"), None)
+            if vs is None:
+                return False
+            cc = vs.codec_context
+            extradata = bytes(cc.extradata) if cc.extradata is not None else b""
+            fingerprints.append((
+                cc.name,
+                cc.width,
+                cc.height,
+                str(cc.pix_fmt),
+                str(vs.average_rate),
+                extradata,
+            ))
+    return all(fp == fingerprints[0] for fp in fingerprints)
+
+
+def _concat_stream_copy_pyav(input_paths: list[Path], output_video_path: Path) -> None:
+    """Fast-path stream-copy concat via pyav's concat demuxer."""
     with tempfile.NamedTemporaryFile(mode="w", suffix=".ffconcat", delete=False) as tmp_concatenate_file:
         tmp_concatenate_file.write("ffconcat version 1.0\n")
-        for input_path in input_video_paths:
+        for input_path in input_paths:
             tmp_concatenate_file.write(f"file '{str(input_path.resolve())}'\n")
         tmp_concatenate_file.flush()
         tmp_concatenate_path = tmp_concatenate_file.name
 
-    # Create input and output containers
     input_container = av.open(
         tmp_concatenate_path, mode="r", format="concat", options={"safe": "0"}
-    )  # safe = 0 allows absolute paths as well as relative paths
+    )
 
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_named_file:
         tmp_output_video_path = tmp_named_file.name
 
     output_container = av.open(
         tmp_output_video_path, mode="w", options={"movflags": "faststart"}
-    )  # faststart is to move the metadata to the beginning of the file to speed up loading
+    )
 
-    # Replicate input streams in output container
     stream_map = {}
     for input_stream in input_container.streams:
-        if input_stream.type in ("video", "audio", "subtitle"):  # only copy compatible streams
+        if input_stream.type in ("video", "audio", "subtitle"):
             stream_map[input_stream.index] = output_container.add_stream_from_template(
                 template=input_stream, opaque=True
             )
-
-            # set the time base to the input stream time base (missing in the codec context)
             stream_map[input_stream.index].time_base = input_stream.time_base
 
-    # Demux + remux packets (no re-encode)
     for packet in input_container.demux():
-        # Skip packets from un-mapped streams
         if packet.stream.index not in stream_map:
             continue
-
-        # Skip demux flushing packets
         if packet.dts is None:
             continue
-
         output_stream = stream_map[packet.stream.index]
         packet.stream = output_stream
         output_container.mux(packet)
 
     input_container.close()
     output_container.close()
+    shutil.move(tmp_output_video_path, output_video_path)
+    Path(tmp_concatenate_path).unlink()
+
+
+def _concat_reencode_ffmpeg(input_paths: list[Path], output_video_path: Path) -> None:
+    """Safe-path concat: ffmpeg concat demuxer with libx264 re-encode.
+
+    Required when inputs have non-uniform codec parameters; stream copy is unsafe.
+    Encoder settings match the normalization path used by the dataset pipeline so
+    outputs remain byte-compatible with subsequent concat rounds.
+    """
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".ffconcat", delete=False) as tmp_concatenate_file:
+        tmp_concatenate_file.write("ffconcat version 1.0\n")
+        for input_path in input_paths:
+            tmp_concatenate_file.write(f"file '{str(input_path.resolve())}'\n")
+        tmp_concatenate_file.flush()
+        tmp_concatenate_path = tmp_concatenate_file.name
+
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_named_file:
+        tmp_output_video_path = tmp_named_file.name
+
+    cmd = [
+        "ffmpeg", "-y", "-v", "error",
+        "-f", "concat", "-safe", "0", "-i", tmp_concatenate_path,
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+        "-profile:v", "high", "-level", "4.0", "-pix_fmt", "yuv420p",
+        "-g", "30", "-keyint_min", "30", "-sc_threshold", "0",
+        "-vsync", "0", "-an", "-movflags", "+faststart",
+        tmp_output_video_path,
+    ]
+    subprocess.run(cmd, check=True)
     shutil.move(tmp_output_video_path, output_video_path)
     Path(tmp_concatenate_path).unlink()
 
