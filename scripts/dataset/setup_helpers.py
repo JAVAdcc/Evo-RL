@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-DEFAULT_SETUP_PATH = Path.home() / ".roboclaw/workspace/embodied/setup.json"
+DEFAULT_SETUP_PATH = Path.home() / ".roboclaw/workspace/embodied/manifest.json"
 DEFAULT_DATASET_ROOT = Path.home() / ".roboclaw/workspace/embodied/datasets"
 
 
