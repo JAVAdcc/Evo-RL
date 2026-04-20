@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 import torch
 
@@ -24,6 +24,25 @@ class TrainingMetrics:
     actor_losses: list[float] = field(default_factory=list)
     reconstruction_losses: list[float] = field(default_factory=list)
     env_steps: int = 0
+
+
+def _build_rl_checkpoint_metadata(config: RLTConfig, metadata: dict | None = None) -> dict:
+    """Merge caller metadata with the full actor/critic training config."""
+    merged = dict(metadata or {})
+    merged["actor"] = asdict(config.actor)
+    merged["critic"] = asdict(config.critic)
+    merged["training"] = {
+        "gamma": config.training.gamma,
+        "beta": config.training.beta,
+        "tau": config.training.tau,
+        "batch_size": config.training.batch_size,
+        "utd_ratio": config.training.utd_ratio,
+        "actor_update_interval": config.training.actor_update_interval,
+    }
+    merged["chunk_length"] = config.chunk_length
+    merged["action_dim"] = config.action_dim
+    merged["proprio_dim"] = config.proprio_dim
+    return merged
 
 
 def _cosine_lr(step: int, warmup: int, total: int, peak_lr: float, min_lr: float) -> float:
@@ -265,8 +284,7 @@ def _save_rl_checkpoint(
         "critic_losses": metrics.critic_losses,
         "actor_losses": metrics.actor_losses,
     }
-    if metadata:
-        ckpt["metadata"] = metadata
+    ckpt["metadata"] = _build_rl_checkpoint_metadata(algorithm.config, metadata)
     torch.save(ckpt, path / "rl_checkpoint.pt")
     logger.info("RL checkpoint saved at step %d to %s", step, save_dir)
 

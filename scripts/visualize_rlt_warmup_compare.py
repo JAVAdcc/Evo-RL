@@ -147,6 +147,20 @@ def load_action_quantiles(dataset) -> tuple[np.ndarray, np.ndarray]:
     return q01, q99
 
 
+def load_state_quantiles(dataset) -> tuple[np.ndarray, np.ndarray]:
+    stats = dataset.meta.stats["observation.state"]
+    q01 = stats["q01"].numpy() if isinstance(stats["q01"], torch.Tensor) else np.array(stats["q01"])
+    q99 = stats["q99"].numpy() if isinstance(stats["q99"], torch.Tensor) else np.array(stats["q99"])
+    return q01, q99
+
+
+def normalize_proprio(proprio: torch.Tensor, q01: torch.Tensor, q99: torch.Tensor) -> torch.Tensor:
+    denom = q99 - q01
+    denom = torch.where(denom.abs() < 1e-8, torch.full_like(denom, 1e-8), denom)
+    proprio = (proprio - q01) / denom * 2.0 - 1.0
+    return proprio.clamp(-1.0, 1.0)
+
+
 def unnormalize_actions(actions: np.ndarray, q01: np.ndarray, q99: np.ndarray) -> np.ndarray:
     return (actions + 1.0) / 2.0 * (q99 - q01) + q01
 
@@ -180,6 +194,8 @@ def run_vla_inference(
     camera_full_keys: list[str],
     device: str,
     stride: int,
+    state_q01: torch.Tensor,
+    state_q99: torch.Tensor,
 ) -> np.ndarray:
     from lerobot.rlt.interfaces import Observation
 
@@ -192,7 +208,8 @@ def run_vla_inference(
         images = {}
         for full_key in camera_full_keys:
             images[full_key.split(".")[-1]] = item[full_key].unsqueeze(0).to(device)
-        proprio = item["observation.state"].unsqueeze(0).to(device)
+        proprio = item["observation.state"].unsqueeze(0).to(device=device, dtype=torch.float32)
+        proprio = normalize_proprio(proprio, state_q01, state_q99)
         obs = Observation(images=images, proprio=proprio)
         with torch.inference_mode():
             vla_out = vla.forward_vla(obs)
@@ -215,10 +232,14 @@ def resolve_rl_model_paths(args: argparse.Namespace) -> RLModelPaths:
     config_path = args.rl_config or resolve_hf_file(args.hf_repo, DEFAULT_RL_CONFIG_PATH)
     metrics_path = args.ac_metrics or None
     if metrics_path is None:
-        try:
-            metrics_path = resolve_hf_file(args.hf_repo, DEFAULT_AC_METRICS_PATH)
-        except Exception:
-            metrics_path = None
+        sibling_metrics = Path(ac_ckpt).with_name("metrics.json")
+        if sibling_metrics.exists():
+            metrics_path = str(sibling_metrics)
+        else:
+            try:
+                metrics_path = resolve_hf_file(args.hf_repo, DEFAULT_AC_METRICS_PATH)
+            except Exception:
+                metrics_path = None
 
     return RLModelPaths(
         vla_model=args.rl_vla_model,
@@ -230,19 +251,22 @@ def resolve_rl_model_paths(args: argparse.Namespace) -> RLModelPaths:
 
 
 def load_ac_metadata(ac_ckpt_path: str, metrics_path: str | None) -> tuple[dict, dict]:
-    from lerobot.rlt.utils import infer_actor_architecture
-
     ac_ckpt = torch.load(ac_ckpt_path, map_location="cpu", weights_only=False)
-    actor_state = ac_ckpt["actor_state_dict"]
-    inferred = infer_actor_architecture(actor_state)
-    metadata = {}
+    metrics_metadata = {}
     if metrics_path:
         metrics = json.loads(Path(metrics_path).read_text())
-        metadata = metrics.get("config", {})
-    return ac_ckpt, metadata or inferred
+        metrics_metadata = metrics.get("config", {})
+    return ac_ckpt, {
+        "checkpoint": ac_ckpt.get("metadata", {}),
+        "metrics": metrics_metadata,
+    }
 
 
-def infer_critic_architecture(critic_state_dict: dict) -> dict:
+def infer_critic_architecture(
+    critic_state_dict: dict,
+    *,
+    default_activation: str = "relu",
+) -> dict:
     """Infer TwinCritic construction kwargs from q1 sub-network."""
     q1_keys = {k.removeprefix("q1."): v for k, v in critic_state_dict.items() if k.startswith("q1.")}
     if "net.input_proj.weight" in q1_keys:
@@ -256,7 +280,7 @@ def infer_critic_architecture(critic_state_dict: dict) -> dict:
         return {
             "hidden_dim": hidden_dim,
             "num_layers": len(block_indices),
-            "activation": "relu",
+            "activation": default_activation,
             "layer_norm": layer_norm,
             "residual": True,
         }
@@ -272,17 +296,29 @@ def infer_critic_architecture(critic_state_dict: dict) -> dict:
     return {
         "hidden_dim": hidden_dim,
         "num_layers": len(linear_keys) - 1,
-        "activation": "relu",
+        "activation": default_activation,
         "layer_norm": layer_norm,
         "residual": False,
     }
 
 
-def load_critic_from_ckpt(ac_ckpt: dict, state_dim: int, chunk_dim: int, device: str):
+def load_critic_from_ckpt(ac_ckpt: dict, config, state_dim: int, chunk_dim: int, device: str):
     """Create TwinCritic from AC checkpoint dict and load weights."""
     from lerobot.rlt.critic import TwinCritic
 
-    arch = infer_critic_architecture(ac_ckpt["critic_state_dict"])
+    checkpoint_metadata = ac_ckpt.get("metadata", {})
+    checkpoint_critic = checkpoint_metadata.get("critic", {})
+    inferred = infer_critic_architecture(
+        ac_ckpt["critic_state_dict"],
+        default_activation=config.critic.activation,
+    )
+    arch = {
+        "hidden_dim": int(checkpoint_critic.get("hidden_dim", inferred["hidden_dim"])),
+        "num_layers": int(checkpoint_critic.get("num_layers", inferred["num_layers"])),
+        "activation": str(checkpoint_critic.get("activation", inferred["activation"])),
+        "layer_norm": bool(checkpoint_critic.get("layer_norm", inferred["layer_norm"])),
+        "residual": bool(checkpoint_critic.get("residual", inferred["residual"])),
+    }
     critic = TwinCritic(state_dim=state_dim, chunk_dim=chunk_dim, **arch)
     critic.load_state_dict(ac_ckpt["critic_state_dict"])
     return critic.to(device).eval()
@@ -296,15 +332,31 @@ def load_rl_policy(paths: RLModelPaths, task: str, device: str):
 
     config = RLTConfig.from_yaml(paths.config_path)
     ac_ckpt, ac_metadata = load_ac_metadata(paths.ac_ckpt, paths.metrics_path)
-    inferred = infer_actor_architecture(ac_ckpt["actor_state_dict"])
+    checkpoint_metadata = ac_metadata.get("checkpoint", {})
+    metrics_metadata = ac_metadata.get("metrics", {})
+    checkpoint_actor = checkpoint_metadata.get("actor", {})
+    checkpoint_critic = checkpoint_metadata.get("critic", {})
+    inferred = infer_actor_architecture(
+        ac_ckpt["actor_state_dict"],
+        default_activation=config.actor.activation,
+        default_fixed_std=config.actor.fixed_std,
+        default_ref_dropout_p=config.actor.ref_dropout_p,
+    )
 
-    config.actor.hidden_dim = int(ac_metadata.get("actor_hidden", inferred["hidden_dim"]))
-    config.actor.num_layers = int(ac_metadata.get("actor_layers", inferred["num_layers"]))
-    config.actor.activation = str(ac_metadata.get("actor_activation", inferred["activation"]))
-    config.actor.layer_norm = bool(ac_metadata.get("actor_layer_norm", inferred["layer_norm"]))
-    config.actor.residual = bool(ac_metadata.get("actor_residual", inferred["residual"]))
-    config.actor.fixed_std = float(ac_metadata.get("fixed_std", inferred["fixed_std"]))
-    config.actor.ref_dropout_p = float(ac_metadata.get("ref_dropout_p", inferred["ref_dropout_p"]))
+    config.actor.hidden_dim = int(checkpoint_actor.get("hidden_dim", metrics_metadata.get("actor_hidden", inferred["hidden_dim"])))
+    config.actor.num_layers = int(checkpoint_actor.get("num_layers", metrics_metadata.get("actor_layers", inferred["num_layers"])))
+    config.actor.activation = str(checkpoint_actor.get("activation", metrics_metadata.get("actor_activation", inferred["activation"])))
+    config.actor.layer_norm = bool(checkpoint_actor.get("layer_norm", metrics_metadata.get("actor_layer_norm", inferred["layer_norm"])))
+    config.actor.residual = bool(checkpoint_actor.get("residual", metrics_metadata.get("actor_residual", inferred["residual"])))
+    config.actor.fixed_std = float(checkpoint_actor.get("fixed_std", metrics_metadata.get("fixed_std", inferred["fixed_std"])))
+    config.actor.ref_dropout_p = float(checkpoint_actor.get("ref_dropout_p", metrics_metadata.get("ref_dropout_p", inferred["ref_dropout_p"])))
+
+    if checkpoint_critic:
+        config.critic.hidden_dim = int(checkpoint_critic.get("hidden_dim", config.critic.hidden_dim))
+        config.critic.num_layers = int(checkpoint_critic.get("num_layers", config.critic.num_layers))
+        config.critic.activation = str(checkpoint_critic.get("activation", config.critic.activation))
+        config.critic.layer_norm = bool(checkpoint_critic.get("layer_norm", config.critic.layer_norm))
+        config.critic.residual = bool(checkpoint_critic.get("residual", config.critic.residual))
 
     vla = Pi05VLAAdapter(
         model_path=paths.vla_model,
@@ -329,7 +381,7 @@ def load_rl_policy(paths: RLModelPaths, task: str, device: str):
 
     state_dim = config.rl_token.token_dim + config.proprio_dim
     chunk_dim = config.chunk_length * config.action_dim
-    critic = load_critic_from_ckpt(ac_ckpt, state_dim, chunk_dim, device)
+    critic = load_critic_from_ckpt(ac_ckpt, config, state_dim, chunk_dim, device)
     return policy, critic
 
 
@@ -340,6 +392,8 @@ def run_rl_inference(
     camera_full_keys: list[str],
     stride: int,
     device: str,
+    state_q01: torch.Tensor,
+    state_q99: torch.Tensor,
 ) -> tuple[np.ndarray, np.ndarray]:
     from lerobot.rlt.interfaces import Observation
     from lerobot.rlt.utils import flatten_chunk
@@ -354,7 +408,8 @@ def run_rl_inference(
         images = {}
         for full_key in camera_full_keys:
             images[full_key.split(".")[-1]] = item[full_key].unsqueeze(0).to(device)
-        proprio = item["observation.state"].unsqueeze(0).to(device)
+        proprio = item["observation.state"].unsqueeze(0).to(device=device, dtype=torch.float32)
+        proprio = normalize_proprio(proprio, state_q01, state_q99)
         obs = Observation(images=images, proprio=proprio)
         with torch.inference_mode():
             action_chunk, _, state_vec, _ = policy.select_action(obs, deterministic=True)
@@ -790,6 +845,9 @@ def main() -> None:
     camera_keys = detect_camera_keys(dataset)
     camera_full_keys = [f"observation.images.{key}" for key in camera_keys]
     q01, q99 = load_action_quantiles(dataset)
+    state_q01_np, state_q99_np = load_state_quantiles(dataset)
+    state_q01 = torch.as_tensor(state_q01_np, dtype=torch.float32, device=args.device)
+    state_q99 = torch.as_tensor(state_q99_np, dtype=torch.float32, device=args.device)
     gt_actions = extract_ground_truth(dataset, args.stride)
     gt_actions = gt_actions[:, :12]
 
@@ -814,6 +872,8 @@ def main() -> None:
             camera_full_keys,
             args.device,
             args.stride,
+            state_q01,
+            state_q99,
         )
         vla_actions = unnormalize_actions(vla_norm[:, :12], q01[:12], q99[:12])
         del vla_policy
@@ -832,6 +892,8 @@ def main() -> None:
             camera_full_keys,
             args.stride,
             args.device,
+            state_q01,
+            state_q99,
         )
         rl_actions = unnormalize_actions(rl_norm[:, :12], q01[:12], q99[:12])
         del rl_policy, critic
