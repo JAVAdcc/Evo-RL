@@ -140,25 +140,43 @@ def detect_camera_keys(dataset) -> list[str]:
     return [key.removeprefix("observation.images.") for key in dataset.features if key.startswith("observation.images.")]
 
 
-def load_action_quantiles(dataset) -> tuple[np.ndarray, np.ndarray]:
-    stats = dataset.meta.stats["action"]
+def load_feature_quantiles(dataset, key: str) -> tuple[np.ndarray, np.ndarray]:
+    stats = dataset.meta.stats[key]
     q01 = stats["q01"].numpy() if isinstance(stats["q01"], torch.Tensor) else np.array(stats["q01"])
     q99 = stats["q99"].numpy() if isinstance(stats["q99"], torch.Tensor) else np.array(stats["q99"])
     return q01, q99
+
+
+def load_action_quantiles(dataset) -> tuple[np.ndarray, np.ndarray]:
+    return load_feature_quantiles(dataset, "action")
 
 
 def load_state_quantiles(dataset) -> tuple[np.ndarray, np.ndarray]:
-    stats = dataset.meta.stats["observation.state"]
-    q01 = stats["q01"].numpy() if isinstance(stats["q01"], torch.Tensor) else np.array(stats["q01"])
-    q99 = stats["q99"].numpy() if isinstance(stats["q99"], torch.Tensor) else np.array(stats["q99"])
-    return q01, q99
+    return load_feature_quantiles(dataset, "observation.state")
 
 
-def normalize_proprio(proprio: torch.Tensor, q01: torch.Tensor, q99: torch.Tensor) -> torch.Tensor:
+def normalize_quantiles(tensor: torch.Tensor, q01: torch.Tensor, q99: torch.Tensor) -> torch.Tensor:
     denom = q99 - q01
     denom = torch.where(denom.abs() < 1e-8, torch.full_like(denom, 1e-8), denom)
-    proprio = (proprio - q01) / denom * 2.0 - 1.0
-    return proprio.clamp(-1.0, 1.0)
+    return (tensor - q01) / denom * 2.0 - 1.0
+
+
+def make_observation(
+    item,
+    camera_full_keys: list[str],
+    device: str,
+    proprio_q01: torch.Tensor,
+    proprio_q99: torch.Tensor,
+):
+    from lerobot.rlt.interfaces import Observation
+
+    images = {}
+    for full_key in camera_full_keys:
+        images[full_key.split(".")[-1]] = item[full_key].unsqueeze(0).to(device)
+    proprio = item["observation.state"].to(dtype=torch.float32)
+    proprio = normalize_quantiles(proprio, proprio_q01, proprio_q99)
+    proprio = proprio.unsqueeze(0).to(device)
+    return Observation(images=images, proprio=proprio)
 
 
 def unnormalize_actions(actions: np.ndarray, q01: np.ndarray, q99: np.ndarray) -> np.ndarray:
@@ -192,25 +210,20 @@ def run_vla_inference(
     vla,
     dataset,
     camera_full_keys: list[str],
+    state_q01: np.ndarray,
+    state_q99: np.ndarray,
     device: str,
     stride: int,
-    state_q01: torch.Tensor,
-    state_q99: torch.Tensor,
 ) -> np.ndarray:
-    from lerobot.rlt.interfaces import Observation
-
     actions = []
     frame_indices = list(range(0, len(dataset), stride))
+    proprio_q01 = torch.as_tensor(state_q01, dtype=torch.float32)
+    proprio_q99 = torch.as_tensor(state_q99, dtype=torch.float32)
     log.info("VLA inference over %d frames", len(frame_indices))
     start = time.monotonic()
     for index in tqdm(frame_indices, desc="VLA"):
         item = dataset[index]
-        images = {}
-        for full_key in camera_full_keys:
-            images[full_key.split(".")[-1]] = item[full_key].unsqueeze(0).to(device)
-        proprio = item["observation.state"].unsqueeze(0).to(device=device, dtype=torch.float32)
-        proprio = normalize_proprio(proprio, state_q01, state_q99)
-        obs = Observation(images=images, proprio=proprio)
+        obs = make_observation(item, camera_full_keys, device, proprio_q01, proprio_q99)
         with torch.inference_mode():
             vla_out = vla.forward_vla(obs)
         actions.append(vla_out.sampled_action_chunk[0, 0, :].cpu().numpy())
@@ -232,14 +245,10 @@ def resolve_rl_model_paths(args: argparse.Namespace) -> RLModelPaths:
     config_path = args.rl_config or resolve_hf_file(args.hf_repo, DEFAULT_RL_CONFIG_PATH)
     metrics_path = args.ac_metrics or None
     if metrics_path is None:
-        sibling_metrics = Path(ac_ckpt).with_name("metrics.json")
-        if sibling_metrics.exists():
-            metrics_path = str(sibling_metrics)
-        else:
-            try:
-                metrics_path = resolve_hf_file(args.hf_repo, DEFAULT_AC_METRICS_PATH)
-            except Exception:
-                metrics_path = None
+        try:
+            metrics_path = resolve_hf_file(args.hf_repo, DEFAULT_AC_METRICS_PATH)
+        except Exception:
+            metrics_path = None
 
     return RLModelPaths(
         vla_model=args.rl_vla_model,
@@ -251,22 +260,19 @@ def resolve_rl_model_paths(args: argparse.Namespace) -> RLModelPaths:
 
 
 def load_ac_metadata(ac_ckpt_path: str, metrics_path: str | None) -> tuple[dict, dict]:
+    from lerobot.rlt.utils import infer_actor_architecture
+
     ac_ckpt = torch.load(ac_ckpt_path, map_location="cpu", weights_only=False)
-    metrics_metadata = {}
+    actor_state = ac_ckpt["actor_state_dict"]
+    inferred = infer_actor_architecture(actor_state)
+    metadata = {}
     if metrics_path:
         metrics = json.loads(Path(metrics_path).read_text())
-        metrics_metadata = metrics.get("config", {})
-    return ac_ckpt, {
-        "checkpoint": ac_ckpt.get("metadata", {}),
-        "metrics": metrics_metadata,
-    }
+        metadata = metrics.get("config", {})
+    return ac_ckpt, metadata or inferred
 
 
-def infer_critic_architecture(
-    critic_state_dict: dict,
-    *,
-    default_activation: str = "relu",
-) -> dict:
+def infer_critic_architecture(critic_state_dict: dict) -> dict:
     """Infer TwinCritic construction kwargs from q1 sub-network."""
     q1_keys = {k.removeprefix("q1."): v for k, v in critic_state_dict.items() if k.startswith("q1.")}
     if "net.input_proj.weight" in q1_keys:
@@ -280,7 +286,7 @@ def infer_critic_architecture(
         return {
             "hidden_dim": hidden_dim,
             "num_layers": len(block_indices),
-            "activation": default_activation,
+            "activation": "relu",
             "layer_norm": layer_norm,
             "residual": True,
         }
@@ -296,29 +302,17 @@ def infer_critic_architecture(
     return {
         "hidden_dim": hidden_dim,
         "num_layers": len(linear_keys) - 1,
-        "activation": default_activation,
+        "activation": "relu",
         "layer_norm": layer_norm,
         "residual": False,
     }
 
 
-def load_critic_from_ckpt(ac_ckpt: dict, config, state_dim: int, chunk_dim: int, device: str):
+def load_critic_from_ckpt(ac_ckpt: dict, state_dim: int, chunk_dim: int, device: str):
     """Create TwinCritic from AC checkpoint dict and load weights."""
     from lerobot.rlt.critic import TwinCritic
 
-    checkpoint_metadata = ac_ckpt.get("metadata", {})
-    checkpoint_critic = checkpoint_metadata.get("critic", {})
-    inferred = infer_critic_architecture(
-        ac_ckpt["critic_state_dict"],
-        default_activation=config.critic.activation,
-    )
-    arch = {
-        "hidden_dim": int(checkpoint_critic.get("hidden_dim", inferred["hidden_dim"])),
-        "num_layers": int(checkpoint_critic.get("num_layers", inferred["num_layers"])),
-        "activation": str(checkpoint_critic.get("activation", inferred["activation"])),
-        "layer_norm": bool(checkpoint_critic.get("layer_norm", inferred["layer_norm"])),
-        "residual": bool(checkpoint_critic.get("residual", inferred["residual"])),
-    }
+    arch = infer_critic_architecture(ac_ckpt["critic_state_dict"])
     critic = TwinCritic(state_dim=state_dim, chunk_dim=chunk_dim, **arch)
     critic.load_state_dict(ac_ckpt["critic_state_dict"])
     return critic.to(device).eval()
@@ -332,31 +326,15 @@ def load_rl_policy(paths: RLModelPaths, task: str, device: str):
 
     config = RLTConfig.from_yaml(paths.config_path)
     ac_ckpt, ac_metadata = load_ac_metadata(paths.ac_ckpt, paths.metrics_path)
-    checkpoint_metadata = ac_metadata.get("checkpoint", {})
-    metrics_metadata = ac_metadata.get("metrics", {})
-    checkpoint_actor = checkpoint_metadata.get("actor", {})
-    checkpoint_critic = checkpoint_metadata.get("critic", {})
-    inferred = infer_actor_architecture(
-        ac_ckpt["actor_state_dict"],
-        default_activation=config.actor.activation,
-        default_fixed_std=config.actor.fixed_std,
-        default_ref_dropout_p=config.actor.ref_dropout_p,
-    )
+    inferred = infer_actor_architecture(ac_ckpt["actor_state_dict"])
 
-    config.actor.hidden_dim = int(checkpoint_actor.get("hidden_dim", metrics_metadata.get("actor_hidden", inferred["hidden_dim"])))
-    config.actor.num_layers = int(checkpoint_actor.get("num_layers", metrics_metadata.get("actor_layers", inferred["num_layers"])))
-    config.actor.activation = str(checkpoint_actor.get("activation", metrics_metadata.get("actor_activation", inferred["activation"])))
-    config.actor.layer_norm = bool(checkpoint_actor.get("layer_norm", metrics_metadata.get("actor_layer_norm", inferred["layer_norm"])))
-    config.actor.residual = bool(checkpoint_actor.get("residual", metrics_metadata.get("actor_residual", inferred["residual"])))
-    config.actor.fixed_std = float(checkpoint_actor.get("fixed_std", metrics_metadata.get("fixed_std", inferred["fixed_std"])))
-    config.actor.ref_dropout_p = float(checkpoint_actor.get("ref_dropout_p", metrics_metadata.get("ref_dropout_p", inferred["ref_dropout_p"])))
-
-    if checkpoint_critic:
-        config.critic.hidden_dim = int(checkpoint_critic.get("hidden_dim", config.critic.hidden_dim))
-        config.critic.num_layers = int(checkpoint_critic.get("num_layers", config.critic.num_layers))
-        config.critic.activation = str(checkpoint_critic.get("activation", config.critic.activation))
-        config.critic.layer_norm = bool(checkpoint_critic.get("layer_norm", config.critic.layer_norm))
-        config.critic.residual = bool(checkpoint_critic.get("residual", config.critic.residual))
+    config.actor.hidden_dim = int(ac_metadata.get("actor_hidden", inferred["hidden_dim"]))
+    config.actor.num_layers = int(ac_metadata.get("actor_layers", inferred["num_layers"]))
+    config.actor.activation = str(ac_metadata.get("actor_activation", inferred["activation"]))
+    config.actor.layer_norm = bool(ac_metadata.get("actor_layer_norm", inferred["layer_norm"]))
+    config.actor.residual = bool(ac_metadata.get("actor_residual", inferred["residual"]))
+    config.actor.fixed_std = float(ac_metadata.get("fixed_std", inferred["fixed_std"]))
+    config.actor.ref_dropout_p = float(ac_metadata.get("ref_dropout_p", inferred["ref_dropout_p"]))
 
     vla = Pi05VLAAdapter(
         model_path=paths.vla_model,
@@ -381,7 +359,7 @@ def load_rl_policy(paths: RLModelPaths, task: str, device: str):
 
     state_dim = config.rl_token.token_dim + config.proprio_dim
     chunk_dim = config.chunk_length * config.action_dim
-    critic = load_critic_from_ckpt(ac_ckpt, config, state_dim, chunk_dim, device)
+    critic = load_critic_from_ckpt(ac_ckpt, state_dim, chunk_dim, device)
     return policy, critic
 
 
@@ -390,36 +368,64 @@ def run_rl_inference(
     critic,
     dataset,
     camera_full_keys: list[str],
+    action_q01: np.ndarray,
+    action_q99: np.ndarray,
+    state_q01: np.ndarray,
+    state_q99: np.ndarray,
     stride: int,
     device: str,
-    state_q01: torch.Tensor,
-    state_q99: torch.Tensor,
-) -> tuple[np.ndarray, np.ndarray]:
-    from lerobot.rlt.interfaces import Observation
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     from lerobot.rlt.utils import flatten_chunk
 
     actions = []
-    q_values = []
+    q_policy_values = []
+    q_ref_values = []
+    q_expert_values = []
     frame_indices = list(range(0, len(dataset), stride))
+    action_dim = int(dataset[0]["action"].shape[0])
+    q01 = torch.as_tensor(action_q01[:action_dim], dtype=torch.float32)
+    q99 = torch.as_tensor(action_q99[:action_dim], dtype=torch.float32)
+    proprio_q01 = torch.as_tensor(state_q01, dtype=torch.float32)
+    proprio_q99 = torch.as_tensor(state_q99, dtype=torch.float32)
+    denom = q99 - q01
+    denom = torch.where(denom.abs() < 1e-8, torch.full_like(denom, 1e-8), denom)
+    expert_actions_norm = torch.stack([
+        (dataset[idx]["action"][:action_dim].float() - q01) / denom * 2.0 - 1.0
+        for idx in range(len(dataset))
+    ])
     log.info("RL inference over %d frames", len(frame_indices))
     start = time.monotonic()
     for index in tqdm(frame_indices, desc="RL"):
         item = dataset[index]
-        images = {}
-        for full_key in camera_full_keys:
-            images[full_key.split(".")[-1]] = item[full_key].unsqueeze(0).to(device)
-        proprio = item["observation.state"].unsqueeze(0).to(device=device, dtype=torch.float32)
-        proprio = normalize_proprio(proprio, state_q01, state_q99)
-        obs = Observation(images=images, proprio=proprio)
+        obs = make_observation(item, camera_full_keys, device, proprio_q01, proprio_q99)
         with torch.inference_mode():
-            action_chunk, _, state_vec, _ = policy.select_action(obs, deterministic=True)
+            action_chunk, _, state_vec, ref_chunk = policy.select_action(obs, deterministic=True)
+            chunk_len = action_chunk.shape[1]
+            expert_chunk = torch.zeros(
+                (1, chunk_len, action_dim), device=device, dtype=action_chunk.dtype,
+            )
+            available = min(chunk_len, len(dataset) - index)
+            expert_chunk[0, :available] = expert_actions_norm[index : index + available].to(
+                device=device, dtype=action_chunk.dtype,
+            )
             action_flat = flatten_chunk(action_chunk)
-            q_val = critic.min_q(state_vec, action_flat)
-            q_values.append(q_val.item())
+            ref_flat = flatten_chunk(ref_chunk)
+            expert_flat = flatten_chunk(expert_chunk)
+            q_policy = critic.min_q(state_vec, action_flat)
+            q_ref = critic.min_q(state_vec, ref_flat)
+            q_expert = critic.min_q(state_vec, expert_flat)
+            q_policy_values.append(q_policy.item())
+            q_ref_values.append(q_ref.item())
+            q_expert_values.append(q_expert.item())
         actions.append(action_chunk[0, 0, :].cpu().numpy())
     elapsed = time.monotonic() - start
     log.info("RL done in %.1fs (%.0f ms/frame)", elapsed, elapsed / max(len(actions), 1) * 1000)
-    return np.array(actions), np.array(q_values)
+    return (
+        np.array(actions),
+        np.array(q_policy_values),
+        np.array(q_ref_values),
+        np.array(q_expert_values),
+    )
 
 
 def extract_video_frames(
@@ -507,12 +513,14 @@ def build_stats_html(
 def _build_video_section(
     camera_keys: list[str],
     video_frames: dict[str, list[str]],
-    q_values: np.ndarray | None,
+    q_policy_values: np.ndarray | None,
+    q_ref_values: np.ndarray | None,
+    q_expert_values: np.ndarray | None,
     fps: float,
     stride: int,
     frame_size: tuple[int, int],
 ) -> tuple[str, str]:
-    """Return (video_html, video_js) for the camera + Q-value overlay."""
+    """Return (video_html, video_js) for the camera + Q(actor/ref/expert) overlay."""
     first_key = list(video_frames.keys())[0]
     n_frames = len(video_frames[first_key])
     fw, fh = frame_size
@@ -520,7 +528,9 @@ def _build_video_section(
     frames_json = json.dumps({
         k.split(".")[-1]: v for k, v in video_frames.items()
     })
-    q_json = json.dumps(q_values.tolist()) if q_values is not None else "null"
+    q_policy_json = json.dumps(q_policy_values.tolist()) if q_policy_values is not None else "null"
+    q_ref_json = json.dumps(q_ref_values.tolist()) if q_ref_values is not None else "null"
+    q_expert_json = json.dumps(q_expert_values.tolist()) if q_expert_values is not None else "null"
 
     cam_labels = [k.split(".")[-1] for k in video_frames]
     canvases_html = "\n".join(
@@ -534,7 +544,12 @@ def _build_video_section(
 
     video_html = f"""
     <div id="video-section" style="margin-bottom:24px;">
-      <h3 style="font-family:sans-serif;">Camera Views + Critic Q-value</h3>
+      <h3 style="font-family:sans-serif;">Camera Views + Critic Q(actor/ref/expert)</h3>
+      <div style="margin:6px 0 10px 0;font-family:sans-serif;font-size:12px;color:#444;">
+        Video shows recorded dataset frames. Action curves are rendered below.
+        Overlaid Q curves use the current frame state with actor output, RL-policy reference chunk,
+        and a future expert chunk reconstructed from recorded actions (zero-padded near episode end).
+      </div>
       <div id="cam-row" style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap;">
         {canvases_html}
       </div>
@@ -548,7 +563,9 @@ def _build_video_section(
 
     video_js = f"""
 const VID_FRAMES = {frames_json};
-const Q_VALUES = {q_json};
+const Q_POLICY_VALUES = {q_policy_json};
+const Q_REF_VALUES = {q_ref_json};
+const Q_EXPERT_VALUES = {q_expert_json};
 const VID_N = {n_frames};
 const VID_FPS = {fps};
 const VID_STRIDE = {stride};
@@ -561,13 +578,21 @@ CAM_LABELS.forEach(lbl => {{
   ctxMap[lbl] = document.getElementById('cam-' + lbl).getContext('2d');
 }});
 
-// precompute Q min/max once
+function getAvailableQSeries() {{
+  return [Q_POLICY_VALUES, Q_REF_VALUES, Q_EXPERT_VALUES].filter(Boolean);
+}}
+
+// precompute shared Q min/max once
 let qMin = 0, qMax = 0;
-if (Q_VALUES) {{
-  qMin = Q_VALUES[0]; qMax = Q_VALUES[0];
-  for (let i = 1; i < Q_VALUES.length; i++) {{
-    if (Q_VALUES[i] < qMin) qMin = Q_VALUES[i];
-    if (Q_VALUES[i] > qMax) qMax = Q_VALUES[i];
+const Q_SERIES = getAvailableQSeries();
+if (Q_SERIES.length > 0) {{
+  qMin = Q_SERIES[0][0];
+  qMax = Q_SERIES[0][0];
+  for (const values of Q_SERIES) {{
+    for (let i = 0; i < values.length; i++) {{
+      if (values[i] < qMin) qMin = values[i];
+      if (values[i] > qMax) qMax = values[i];
+    }}
   }}
 }}
 
@@ -584,35 +609,43 @@ function drawVideoFrame(idx) {{
     img.onload = function() {{
       ctx.clearRect(0, 0, FRAME_W, FRAME_H);
       ctx.drawImage(this, 0, 0, FRAME_W, FRAME_H);
-      if (Q_VALUES) drawQOverlay(ctx, FRAME_W, FRAME_H, idx);
+      if (Q_SERIES.length > 0) drawQOverlay(ctx, FRAME_W, FRAME_H, idx);
     }};
     img.src = 'data:image/jpeg;base64,' + VID_FRAMES[lbl][idx];
   }});
   const t = (idx * VID_STRIDE / VID_FPS).toFixed(2);
-  frameInfo.textContent = 'frame ' + idx + '/' + (VID_N - 1) + '  t=' + t + 's'
-    + (Q_VALUES ? '  Q=' + Q_VALUES[idx].toFixed(4) : '');
+  let info = 'frame ' + idx + '/' + (VID_N - 1) + '  t=' + t + 's';
+  if (Q_POLICY_VALUES) info += '  Q(actor)=' + Q_POLICY_VALUES[idx].toFixed(4);
+  if (Q_REF_VALUES) info += '  Q(ref)=' + Q_REF_VALUES[idx].toFixed(4);
+  if (Q_EXPERT_VALUES) info += '  Q(expert)=' + Q_EXPERT_VALUES[idx].toFixed(4);
+  frameInfo.textContent = info;
   frameSlider.value = idx;
 }}
 
+function drawQCurve(ctx, values, color, barY, barH, w, qRange) {{
+  const pad = 5;
+  ctx.beginPath();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  for (let i = 0; i < VID_N; i++) {{
+    const x = (i / (VID_N - 1)) * w;
+    const y = barY + barH - pad - ((values[i] - qMin) / qRange) * (barH - 2 * pad);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }}
+  ctx.stroke();
+}}
+
 function drawQOverlay(ctx, w, h, currentIdx) {{
-  const barH = 50;
+  const barH = 64;
   const barY = h - barH;
   ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
   ctx.fillRect(0, barY, w, barH);
 
   const qRange = qMax - qMin || 1;
-  const pad = 5;
-
-  ctx.beginPath();
-  ctx.strokeStyle = '#FFD700';
-  ctx.lineWidth = 2;
-  for (let i = 0; i < VID_N; i++) {{
-    const x = (i / (VID_N - 1)) * w;
-    const y = barY + barH - pad - ((Q_VALUES[i] - qMin) / qRange) * (barH - 2 * pad);
-    if (i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  }}
-  ctx.stroke();
+  if (Q_POLICY_VALUES) drawQCurve(ctx, Q_POLICY_VALUES, '#FFD700', barY, barH, w, qRange);
+  if (Q_REF_VALUES) drawQCurve(ctx, Q_REF_VALUES, '#00E5FF', barY, barH, w, qRange);
+  if (Q_EXPERT_VALUES) drawQCurve(ctx, Q_EXPERT_VALUES, '#FF5CA8', barY, barH, w, qRange);
 
   const curX = (currentIdx / (VID_N - 1)) * w;
   ctx.beginPath();
@@ -622,9 +655,22 @@ function drawQOverlay(ctx, w, h, currentIdx) {{
   ctx.lineTo(curX, h);
   ctx.stroke();
 
-  ctx.fillStyle = '#FFD700';
-  ctx.font = 'bold 12px monospace';
-  ctx.fillText('Q: ' + Q_VALUES[currentIdx].toFixed(4), 4, barY + 14);
+  ctx.font = 'bold 11px monospace';
+  let textY = barY + 14;
+  if (Q_POLICY_VALUES) {{
+    ctx.fillStyle = '#FFD700';
+    ctx.fillText('Q(actor): ' + Q_POLICY_VALUES[currentIdx].toFixed(4), 4, textY);
+    textY += 12;
+  }}
+  if (Q_REF_VALUES) {{
+    ctx.fillStyle = '#00E5FF';
+    ctx.fillText('Q(ref): ' + Q_REF_VALUES[currentIdx].toFixed(4), 4, textY);
+    textY += 12;
+  }}
+  if (Q_EXPERT_VALUES) {{
+    ctx.fillStyle = '#FF5CA8';
+    ctx.fillText('Q(expert): ' + Q_EXPERT_VALUES[currentIdx].toFixed(4), 4, textY);
+  }}
   ctx.fillStyle = 'rgba(255,255,255,0.6)';
   ctx.font = '10px monospace';
   ctx.fillText(qMax.toFixed(3), w - 52, barY + 12);
@@ -663,7 +709,9 @@ def build_html(
     gt: np.ndarray,
     vla: np.ndarray | None,
     rl: np.ndarray | None,
-    q_values: np.ndarray | None,
+    q_policy_values: np.ndarray | None,
+    q_ref_values: np.ndarray | None,
+    q_expert_values: np.ndarray | None,
     video_frames: dict[str, list[str]] | None,
     camera_keys: list[str],
     *,
@@ -719,7 +767,7 @@ def build_html(
     video_js = ""
     if video_frames:
         video_html, video_js = _build_video_section(
-            camera_keys, video_frames, q_values, fps, stride, frame_size,
+            camera_keys, video_frames, q_policy_values, q_ref_values, q_expert_values, fps, stride, frame_size,
         )
 
     return f"""<!DOCTYPE html>
@@ -845,9 +893,7 @@ def main() -> None:
     camera_keys = detect_camera_keys(dataset)
     camera_full_keys = [f"observation.images.{key}" for key in camera_keys]
     q01, q99 = load_action_quantiles(dataset)
-    state_q01_np, state_q99_np = load_state_quantiles(dataset)
-    state_q01 = torch.as_tensor(state_q01_np, dtype=torch.float32, device=args.device)
-    state_q99 = torch.as_tensor(state_q99_np, dtype=torch.float32, device=args.device)
+    state_q01, state_q99 = load_state_quantiles(dataset)
     gt_actions = extract_ground_truth(dataset, args.stride)
     gt_actions = gt_actions[:, :12]
 
@@ -870,30 +916,34 @@ def main() -> None:
             vla_policy,
             dataset,
             camera_full_keys,
-            args.device,
-            args.stride,
             state_q01,
             state_q99,
+            args.device,
+            args.stride,
         )
         vla_actions = unnormalize_actions(vla_norm[:, :12], q01[:12], q99[:12])
         del vla_policy
         torch.cuda.empty_cache()
 
     rl_actions = None
-    q_values = None
+    q_policy_values = None
+    q_ref_values = None
+    q_expert_values = None
     if not args.no_rl:
         paths = resolve_rl_model_paths(args)
         log.info("Loading RL model with backbone=%s ac=%s", paths.vla_model, paths.ac_ckpt)
         rl_policy, critic = load_rl_policy(paths, args.task, args.device)
-        rl_norm, q_values = run_rl_inference(
+        rl_norm, q_policy_values, q_ref_values, q_expert_values = run_rl_inference(
             rl_policy,
             critic,
             dataset,
             camera_full_keys,
-            args.stride,
-            args.device,
+            q01[:12],
+            q99[:12],
             state_q01,
             state_q99,
+            args.stride,
+            args.device,
         )
         rl_actions = unnormalize_actions(rl_norm[:, :12], q01[:12], q99[:12])
         del rl_policy, critic
@@ -904,7 +954,9 @@ def main() -> None:
         gt_actions,
         vla_actions,
         rl_actions,
-        q_values,
+        q_policy_values,
+        q_ref_values,
+        q_expert_values,
         video_frames,
         camera_keys,
         stride=args.stride,
